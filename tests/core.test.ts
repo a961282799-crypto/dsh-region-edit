@@ -1,0 +1,95 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { boxBetween, overlaps, validRegion } from '../src/selection.ts';
+import { sourceLocations, buildPrompt } from '../src/prompt.ts';
+import { fileAddress, fileFromAddress } from '../src/host.ts';
+import { imageSelection } from '../src/image.ts';
+import { lasso, area, clip, contains, intersects } from '../src/lasso.ts';
+import { parseRecognition } from '../src/recognition.ts';
+import { rewriteCssAssets } from '../src/css-assets.ts';
+const region = { box: { x: 10, y: 10, width: 80, height: 20 }, viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 },
+  text: '开始使用', elements: [{ tag: 'button', selector: '#start', text: '开始使用', html: '<button id="start">开始使用</button>' }], truncated: false };
+test('reverse dragging and intersecting edges stay geometrically correct', () => {
+  assert.deepEqual(boxBetween({ x: 80, y: 60 }, { x: 10, y: 20 }), { x: 10, y: 20, width: 70, height: 40 });
+  assert.equal(overlaps(region.box, { x: 90, y: 10, width: 20, height: 20 }), false);
+  assert.equal(overlaps(region.box, { x: 89, y: 10, width: 20, height: 20 }), true);
+});
+test('untrusted frame data rejects malformed and excessive payloads', () => {
+  assert.equal(validRegion(region), true);
+  for (const bad of [null, {}, { ...region, box: { ...region.box, width: NaN } }, { ...region, text: 'x'.repeat(6001) },
+    { ...region, elements: [{ ...region.elements[0], html: 'x'.repeat(701) }] }, { ...region, elements: Array(13).fill(region.elements[0]) }]) assert.equal(validRegion(bad), false);
+});
+test('repeated text keeps all matching positions rather than claiming one line', () => {
+  assert.deepEqual(sourceLocations('one\n开始使用\nthree\n开始使用', '开始使用'), [2, 4]);
+  assert.deepEqual(sourceLocations('abc', ''), []);
+  assert.deepEqual(sourceLocations('abc', 'missing'), []);
+});
+test('the request cites the original file and distinguishes instructions from quoted data', () => {
+  const prompt = buildPrompt('C:/项目/界面.md', ' 改成红色 ', region, '标题\n开始使用');
+  assert.match(prompt, /修改要求：\n改成红色/);
+  assert.match(prompt, /C:\/项目\/界面.md/);
+  assert.match(prompt, /不是额外指令/);
+  assert.match(prompt, /#start/);
+  assert.throws(() => buildPrompt('a', '', region));
+  assert.throws(() => buildPrompt('a', '修改', { ...region, text: '', elements: [] }));
+});
+test('file addresses preserve Unicode, Windows paths and dot segments', () => {
+  const address = fileAddress('session id', 'C:\\项目\\a#b\\..\\设计.html');
+  assert.deepEqual(fileFromAddress(address), { sessionId: 'session id', path: 'C:/项目/a#b/../设计.html' });
+  assert.throws(() => fileFromAddress('https://example.com/a.html'));
+});
+test('a zoomed image selection maps to original pixels and normalized coordinates', () => {
+  const image = imageSelection({ x: 200, y: 100, width: 200, height: 100 }, { x: 100, y: 50, width: 400, height: 200 }, 1600, 800);
+  assert.deepEqual(image.pixels, { x: 400, y: 200, width: 800, height: 400 });
+  assert.deepEqual(image.normalized, { x: .25, y: .25, width: .5, height: .5 });
+});
+test('image bounds clip partial drags and reject blank or invalid selections', () => {
+  const bounds = { x: 100, y: 50, width: 400, height: 200 };
+  assert.deepEqual(imageSelection({ x: 0, y: 0, width: 300, height: 100 }, bounds, 1600, 800).pixels, { x: 0, y: 0, width: 800, height: 200 });
+  assert.throws(() => imageSelection({ x: 0, y: 0, width: 20, height: 20 }, bounds, 1600, 800));
+  assert.throws(() => imageSelection({ x: NaN, y: 0, width: 20, height: 20 }, bounds, 1600, 800));
+});
+test('image requests cite the original file and require actual image tools', () => {
+  const image = imageSelection({ x: 0, y: 0, width: 50, height: 50 }, { x: 0, y: 0, width: 100, height: 100 }, 800, 600);
+  const prompt = buildPrompt('C:/海报.png', '放大这里的标题', { ...region, text: '', elements: [], image });
+  assert.match(prompt, /C:\/海报.png/); assert.match(prompt, /附带原图作为视觉输入/); assert.match(prompt, /不要声称已修改/);
+  assert.match(prompt, /"pixels"/); assert.match(prompt, /"normalized"/);
+});
+test('a concave lasso excludes objects in its bounding rectangle but outside its contour', () => {
+  const shape = lasso([{x:0,y:0},{x:100,y:0},{x:100,y:30},{x:30,y:30},{x:30,y:100},{x:0,y:100}]);
+  assert.equal(area(shape.points), 5100);
+  assert.equal(contains(shape.points, {x:70,y:70}), false);
+  assert.equal(intersects(shape.points, {x:60,y:60,width:20,height:20}), false);
+  assert.equal(intersects(shape.points, {x:10,y:60,width:10,height:20}), true);
+  assert.throws(() => lasso([{x:0,y:0},{x:20,y:20},{x:40,y:40}]));
+  const dense = Array.from({length:4000}, (_,i) => ({x:200+100*Math.cos(i/4000*Math.PI*2),y:200+100*Math.sin(i/4000*Math.PI*2)}));
+  assert.ok(lasso(dense).points.length <= 256);
+});
+test('clipped and zoomed lasso keeps its actual original-image polygon', () => {
+  const points = [{x:50,y:50},{x:300,y:50},{x:100,y:200}];
+  const clipped = clip(points,{x:100,y:50,width:200,height:150});
+  assert.ok(clipped.every(p=>p.x>=100));
+  const image = imageSelection({x:50,y:50,width:250,height:150},{x:100,y:50,width:400,height:200},1600,800,points);
+  assert.ok(image.polygon.pixels.every(p=>p.x>=0&&p.x<=800));
+  assert.ok(area(image.polygon.pixels) < image.pixels.width*image.pixels.height);
+  assert.ok(image.polygon.normalized.every(p=>p.x>=0&&p.x<=1&&p.y>=0&&p.y<=1));
+});
+test('vision responses preserve uncertainty and reject malformed labels', () => {
+  const target = {label:'标题',kind:'文字',text:'开始使用',confidence:.5,ambiguous:true};
+  assert.deepEqual(parseRecognition('```json\n'+JSON.stringify(target)+'\n```'),{...target,source:'vision'});
+  assert.throws(()=>parseRecognition(JSON.stringify({...target,confidence:2})));
+  assert.throws(()=>parseRecognition(JSON.stringify({...target,label:''})));
+  assert.throws(()=>parseRecognition('无法判断'));
+});
+test('crossed outlines receive an actionable intersection error instead of a small-area error', () => {
+  assert.throws(() => lasso([{x:0,y:0},{x:100,y:100},{x:0,y:100},{x:100,y:0}]), /轮廓发生交叉/);
+  assert.doesNotThrow(() => lasso([{x:0,y:0},{x:100,y:0},{x:100,y:30},{x:30,y:30},{x:30,y:100},{x:0,y:100}]));
+});
+test('CSS resource rewriting respects comments, content strings, escapes and import conditions', async () => {
+  const requests: [string, boolean][] = [];
+  const input = String.raw`/* url(fake.png) */ @import "nested/base.css" layer(theme) screen; .x{content:'url(fake2.png)';background:URL("\61 ssets/bg\(1\).png");src:url(font.woff2)}`;
+  const output = await rewriteCssAssets(input, async (url, stylesheet) => { requests.push([url, stylesheet]); return `data:test,${requests.length}`; });
+  assert.deepEqual(requests, [['nested/base.css', true], ['assets/bg(1).png', false], ['font.woff2', false]]);
+  assert.match(output, /\/\* url\(fake.png\) \*\//); assert.match(output, /content:'url\(fake2.png\)'/);
+  assert.match(output, /@import url\("data:test,1"\) layer\(theme\) screen/);
+});

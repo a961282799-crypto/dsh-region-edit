@@ -1,0 +1,5 @@
+node_modules/
+.work/
+artifacts/
+dist/
+/debug.log

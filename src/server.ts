@@ -1,0 +1,62 @@
+import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol';
+import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
+import { imageMediaType, parseRecognition, recognitionPrompt, recognitionSystem } from './recognition.ts';
+import { validPoints } from './lasso.ts';
+import type { ImageSelection } from './image.ts';
+import type { FileStat } from './host.ts';
+export interface Route { provider: string; model: string }
+export interface Agent { session: { id: string; header: { cwd?: string }; requestHeader(): { config: Route } | undefined } }
+export interface ServerHost {
+  effect(callback: () => (() => void)): void;
+  workspaceFiles: {
+    stat(scope: { workspaceRoot: string }, path: string, signal: AbortSignal): Promise<FileStat>;
+    readBytes(scope: { workspaceRoot: string }, path: string, options: object, signal: AbortSignal): Promise<FileStat & { data: Uint8Array }>;
+  };
+  attachments: { imageLimits: { maxImageBytes: number }; saveImage(input: { data: Uint8Array; mediaType: string; name: string }): Promise<unknown> };
+  sessionProjections: { stateOf(session: Agent['session'], key: string): { pending?: Route | null } | undefined };
+  agentDefaultModel: { currentSelection(): Route };
+  llm: { prepareCall(route: Route & { maxTokens: number }, signal: AbortSignal): Promise<{
+    config: Route; inputModalities?: readonly string[];
+    stream(options: Route & { messages: unknown[]; system: string; sessionId: string; signal: AbortSignal }): AsyncIterable<unknown>;
+  }> };
+}
+export interface RecognitionRequest { path: string; version: string; image: ImageSelection }
+export const inject = ['workspaceFiles', 'llm', 'attachments', 'sessionProjections', 'agentDefaultModel'];
+export class RegionVision extends TypertRemoteService {
+  declare readonly ctx: ServerHost;
+  private lifetime = new AbortController();
+  constructor(ctx: ServerHost) { super(ctx, 'regionEdit'); ctx.effect(() => () => this.lifetime.abort()); }
+  // Keep parameter names: the host's SRC Remote protocol reads agent/request/signal.
+  @Remote
+  async recognize(agent: Agent, request: RecognitionRequest, signal: AbortSignal) {
+    if (!request || typeof request.path !== 'string' || request.path.length > 4096 || typeof request.version !== 'string'
+      || !request.image || !validPoints(request.image.polygon?.normalized)
+      || request.image.polygon.normalized.some(p => p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1)
+      || ![request.image.width, request.image.height].every(n => Number.isFinite(n) && n > 0 && n < 100000)) throw new Error('自由选区数据无效，请重新圈选。');
+    const mediaType = imageMediaType(request.path);
+    if (!mediaType) throw new Error('当前视觉通道支持 PNG、JPEG、WebP 和 GIF，可以自行填写这个文件中的目标。');
+    const deadline = AbortSignal.any([signal, this.lifetime.signal, AbortSignal.timeout(60000)]);
+    if (!agent.session.header.cwd) throw new Error('当前会话没有可用的文件工作区。');
+    const scope = { workspaceRoot: agent.session.header.cwd };
+    const check = (stat: FileStat) => { if (JSON.stringify(stat.version) !== request.version) throw new Error('原图已更新，请重新圈选。'); };
+    const stat = await this.ctx.workspaceFiles.stat(scope, request.path, deadline); check(stat);
+    if ((stat.bytes ?? Infinity) > this.ctx.attachments.imageLimits.maxImageBytes) throw new Error('原图超过当前视觉输入大小限制，可以自行填写圈中目标。');
+    const pending = this.ctx.sessionProjections.stateOf(agent.session, 'modelSelection')?.pending;
+    const route = pending ?? agent.session.requestHeader()?.config ?? this.ctx.agentDefaultModel.currentSelection();
+    const call = await this.ctx.llm.prepareCall({ provider: route.provider, model: route.model, maxTokens: 1600 }, deadline);
+    if (call.inputModalities && !call.inputModalities.includes('image')) throw new Error('当前选择的模型未开放图片输入，请切换到视觉模型，或自行填写目标。');
+    const file = await this.ctx.workspaceFiles.readBytes(scope, request.path, {}, deadline); check(file);
+    const attachment = await this.ctx.attachments.saveImage({ data: file.data, mediaType, name: request.path.split(/[\\/]/).pop()! });
+    const messages = [createUserMessage({ source: { kind: 'dsh-region-edit' }, content: [
+      { type: 'image', attachment }, { type: 'text', text: recognitionPrompt(request.image) }
+    ] })];
+    const assembler = new BlockAssembler();
+    for await (const chunk of call.stream({ ...call.config, messages, system: recognitionSystem, sessionId: agent.session.id, signal: deadline })) { deadline.throwIfAborted(); assembler.push(chunk); }
+    deadline.throwIfAborted();
+    if (assembler.finish.kind !== 'stop') throw new Error(assembler.finish.failure?.message ?? '识别没有完整返回，可以重试或自行填写目标。');
+    const result = parseRecognition(assembler.blocks().filter(b => b.type === 'text').map(b => b.text ?? '').join(''));
+    check(await this.ctx.workspaceFiles.stat(scope, request.path, deadline));
+    return result;
+  }
+}
+export function apply(ctx: ServerHost): void { new RegionVision(ctx); }
