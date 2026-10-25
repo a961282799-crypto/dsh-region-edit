@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { connectFrame } from './bridge.ts';
 import { htmlDocument } from './html-document.ts';
 import type { AssetReader } from './html-document.ts';
+import type { SourceIndex } from './source-map.ts';
 import type { TabInfo } from './host.ts';
 import picker from 'frame-source';
 export interface HtmlProps {
@@ -16,7 +17,7 @@ export interface HtmlProps {
 export function HtmlPreview({ content, resourceAddress, useTabInfo, useInteractivePreview, readAsset, addResource, setResources }: HtmlProps) {
   const interactive = useInteractivePreview(value => value);
   const { tab } = useTabInfo();
-  const [state, setState] = useState<{ html?: string; error?: string }>({});
+  const [state, setState] = useState<{ html?: string; sources?: SourceIndex; source?: string; error?: string }>({});
   const disconnect = useRef<(() => void) | undefined>(undefined);
   useEffect(() => {
     const abort = new AbortController();
@@ -33,7 +34,7 @@ export function HtmlPreview({ content, resourceAddress, useTabInfo, useInteracti
         if (!signal.aborted && result.resourceAddress) addResource(result.resourceAddress);
         return result;
       }, abort.signal)
-        .then(html => { if (!abort.signal.aborted) setState({ html }); })
+        .then(result => { if (!abort.signal.aborted) setState({ ...result, source }); })
         .catch(error => { if (!abort.signal.aborted) setState({ error: String(error.message ?? error) }); });
     }
     return dispose;
@@ -41,5 +42,5 @@ export function HtmlPreview({ content, resourceAddress, useTabInfo, useInteracti
   if (state.error) return <p className="re-status" role="alert">{state.error}</p>;
   if (!state.html) return <p className="re-status" role="status">正在载入预览…</p>;
   return <iframe className="re-frame" name={`dsh-sidebar-html-${tab.id}`} title="圈选预览" sandbox="allow-scripts"
-    srcDoc={state.html} data-region-frame="" onLoad={event => { disconnect.current?.(); disconnect.current = connectFrame(event.currentTarget); }} />;
+    srcDoc={state.html} data-region-frame="" onLoad={event => { disconnect.current?.(); disconnect.current = connectFrame(event.currentTarget, state.sources, state.source); }} />;
 }

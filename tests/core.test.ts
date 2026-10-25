@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { boxBetween, overlaps, validRegion } from '../src/selection.ts';
+import { boxBetween, cleanElement, overlaps, validRegion } from '../src/selection.ts';
 import { sourceLocations, buildPrompt } from '../src/prompt.ts';
 import { fileAddress, fileFromAddress } from '../src/host.ts';
 import { imageSelection } from '../src/image.ts';
 import { lasso, area, clip, contains, intersects } from '../src/lasso.ts';
 import { parseRecognition } from '../src/recognition.ts';
 import { rewriteCssAssets } from '../src/css-assets.ts';
+import { annotateHtml } from '../src/source-map.ts';
+import { parse } from 'parse5';
 const region = { box: { x: 10, y: 10, width: 80, height: 20 }, viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 },
   text: '开始使用', elements: [{ tag: 'button', selector: '#start', text: '开始使用', html: '<button id="start">开始使用</button>' }], truncated: false };
 test('reverse dragging and intersecting edges stay geometrically correct', () => {
@@ -16,7 +18,7 @@ test('reverse dragging and intersecting edges stay geometrically correct', () =>
 });
 test('untrusted frame data rejects malformed and excessive payloads', () => {
   assert.equal(validRegion(region), true);
-  for (const bad of [null, {}, { ...region, box: { ...region.box, width: NaN } }, { ...region, text: 'x'.repeat(6001) },
+  for (const bad of [null, {}, { ...region, box: { ...region.box, width: NaN } }, { ...region, viewport: { ...region.viewport, width: 0 } }, { ...region, text: 'x'.repeat(6001) },
     { ...region, elements: [{ ...region.elements[0], html: 'x'.repeat(701) }] }, { ...region, elements: Array(13).fill(region.elements[0]) }]) assert.equal(validRegion(bad), false);
 });
 test('repeated text keeps all matching positions rather than claiming one line', () => {
@@ -92,4 +94,44 @@ test('CSS resource rewriting respects comments, content strings, escapes and imp
   assert.deepEqual(requests, [['nested/base.css', true], ['assets/bg(1).png', false], ['font.woff2', false]]);
   assert.match(output, /\/\* url\(fake.png\) \*\//); assert.match(output, /content:'url\(fake2.png\)'/);
   assert.match(output, /@import url\("data:test,1"\) layer\(theme\) screen/);
+});
+
+test('HTML locations distinguish identical labels and survive comments, quoted tags and tree repair', () => {
+  const html = '<!doctype html>\r\n<!-- <button>假的</button> -->\r\n<button title="a > b">相同</button>\r\n<button>相同</button>\r\n<table><tr><td>A</td></tr></table>\r\n<script>const x="<button>假的</button>"</script>';
+  const result = annotateHtml(html), parsed = parse(result.html);
+  const pending = [parsed], buttons = [], generated = [];
+  while (pending.length) {
+    const node = pending.pop();
+    if ('childNodes' in node) pending.push(...node.childNodes);
+    if (node.tagName === 'button') buttons.push(node);
+    if (node.tagName === 'tbody') generated.push(node);
+  }
+  assert.equal(buttons.length, 2);
+  assert.deepEqual(buttons.map(n => result.sources[n.attrs.find(a => a.name === 'data-region-source').value].line).sort(), [3, 4]);
+  assert.ok(Object.values(result.sources).some(s => s.snippet === '<button title="a > b">'));
+  assert.equal(generated[0].attrs.some(a => a.name === 'data-region-source'), false);
+});
+
+test('reserved HTML location markers cannot overwrite parser-derived positions', () => {
+  const result = annotateHtml('<button data-region-source="forged">Go</button>');
+  assert.doesNotMatch(result.html, /forged/);
+  assert.ok(Object.values(result.sources).some(s => s.line === 1 && s.column === 1));
+});
+
+test('HTML source mapping uses the same byte limit as the captured file, including multibyte text', () => {
+  const source = '<p>' + '汉'.repeat(350000) + '</p>';
+  assert.ok(source.length < 1024 * 1024);
+  assert.deepEqual(annotateHtml(source), { html: source, sources: {} });
+});
+
+test('frame element context has bounded fields and cannot supply a trusted source location', () => {
+  const context = { classes: 'primary', inlineStyle: '', styles: { color: 'red' }, variables: { '--brand': 'red' }, rules: [] };
+  const element = { ...region.elements[0], context, sourceKey: 's1', source: { line: 999, column: 1, snippet: 'forged' }, extra: 'discard' };
+  assert.equal(validRegion({ ...region, elements: [element], element: { id: 'e1' } }), true);
+  assert.equal(cleanElement(element).source, undefined);
+  assert.equal('extra' in cleanElement(element), false);
+  for (const bad of [{ ...context, styles: { color: 'x'.repeat(301) } }, { ...context, parent: {} },
+    { ...context, rules: Array(9).fill({ selector: 'button', declarations: '' }) }]) {
+    assert.equal(validRegion({ ...region, elements: [{ ...element, context: bad }] }), false);
+  }
 });

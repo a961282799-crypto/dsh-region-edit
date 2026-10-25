@@ -1,9 +1,13 @@
 import { randomToken } from './token.ts';
 import { rewriteCssAssets } from './css-assets.ts';
+import { annotateHtml } from './source-map.ts';
+import type { SourceIndex } from './source-map.ts';
+export interface HtmlDocument { html: string; sources: SourceIndex }
 export type AssetReader = (reference: string, signal: AbortSignal) => Promise<{ data: Uint8Array; resourceAddress?: string }>;
 /** Builds a file preview in an opaque origin; only the picker bridge runs in static mode. */
-export async function htmlDocument(source: string, picker: string, interactive: boolean, read: AssetReader, signal: AbortSignal): Promise<string> {
-  const doc = new DOMParser().parseFromString(source, 'text/html');
+export async function htmlDocument(source: string, picker: string, interactive: boolean, read: AssetReader, signal: AbortSignal): Promise<HtmlDocument> {
+  const annotated = annotateHtml(source);
+  const doc = new DOMParser().parseFromString(annotated.html, 'text/html');
   const nonce = randomToken();
   doc.querySelectorAll('base,meta[http-equiv],iframe,object,embed,portal').forEach(n => n.remove());
   if (!interactive) {
@@ -61,7 +65,9 @@ export async function htmlDocument(source: string, picker: string, interactive: 
     const href = node.getAttribute('href')!;
     if (!local(href) || !/\.css(?:[?#]|$)/i.test(href)) { node.remove(); continue; }
     const reference = relative(href);
-    const style = doc.createElement('style'); style.textContent = await rewriteStyle(new TextDecoder('utf-8', { fatal: true }).decode(await readBounded(reference)), reference, new Set([reference]));
+    const style = doc.createElement('style'); style.setAttribute('data-region-stylesheet', reference);
+    if (node.hasAttribute('media')) style.setAttribute('media', node.getAttribute('media')!);
+    style.textContent = await rewriteStyle(new TextDecoder('utf-8', { fatal: true }).decode(await readBounded(reference)), reference, new Set([reference]));
     node.replaceWith(style);
   }
   for (const node of doc.querySelectorAll('style')) node.textContent = (await rewriteStyle(node.textContent ?? '')).replace(/<\/style/gi, '<\\/style');
@@ -88,8 +94,10 @@ export async function htmlDocument(source: string, picker: string, interactive: 
   const policy = doc.createElement('meta'); policy.httpEquiv = 'Content-Security-Policy';
   policy.content = `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline' data:; img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'`;
   doc.head.prepend(policy);
+  // Running page scripts can replace or copy initial nodes before the bridge binds them.
+  const sources = interactive && doc.querySelector('script') ? {} : annotated.sources;
   const bridge = doc.createElement('script'); bridge.setAttribute('nonce', nonce);
   bridge.textContent = picker.replace(/<\/script/gi, '<\\/script'); doc.head.prepend(bridge); doc.head.prepend(policy);
   signal.throwIfAborted();
-  return '<!doctype html>\n' + doc.documentElement.outerHTML;
+  return { html: '<!doctype html>\n' + doc.documentElement.outerHTML, sources };
 }

@@ -5,10 +5,10 @@ import { buildPrompt } from './prompt.ts';
 import { unwrap, fileFromAddress, fileAddress } from './host.ts';
 import type { Host, PageTarget } from './host.ts';
 import type { Region } from './selection.ts';
-import type { Lasso } from './lasso.ts';
+import type { Selection } from './bridge.ts';
 import { imageMediaType, parseRecognition } from './recognition.ts';
 import type { Recognition } from './recognition.ts';
-import { readRegion } from './bridge.ts';
+import { checkPreviewSource, readRegion } from './bridge.ts';
 import css from './style.css';
 
 const HTML_RENDERER = 'dsh-region-edit/html';
@@ -18,7 +18,7 @@ interface ActionProps {
   absolutePath: string;
   begin(element: HTMLElement, path: string, signal: AbortSignal): Promise<Capture>;
   recognize(capture: Capture, region: Region, signal: AbortSignal): Promise<Recognition>;
-  submit(capture: Capture, instruction: string, region: Region, selection: Lasso, draft: boolean, signal: AbortSignal, target?: Recognition): Promise<void>;
+  submit(capture: Capture, instruction: string, region: Region, selection: Selection, draft: boolean, signal: AbortSignal, target?: Recognition): Promise<void>;
 }
 function RegionAction({ absolutePath, begin, recognize, submit }: ActionProps) {
   const button = useRef<HTMLButtonElement>(null), abort = useRef<AbortController | undefined>(undefined);
@@ -26,6 +26,7 @@ function RegionAction({ absolutePath, begin, recognize, submit }: ActionProps) {
   const [instruction, setInstruction] = useState(''), [hint, setHint] = useState('');
   const [manualTarget, setManualTarget] = useState<string | undefined>();
   const [generation, setGeneration] = useState(0);
+  const html = /\.html?$/i.test(absolutePath);
   const close = useCallback(() => { abort.current?.abort(); setCapture(undefined); setLoading(false); setInstruction(''); setManualTarget(undefined); button.current?.focus({ preventScroll: true }); }, []);
   useEffect(() => () => abort.current?.abort(), []);
   useEffect(() => { abort.current?.abort(); setCapture(undefined); setLoading(false); setError(''); setInstruction(''); setManualTarget(undefined); }, [absolutePath]);
@@ -40,8 +41,8 @@ function RegionAction({ absolutePath, begin, recognize, submit }: ActionProps) {
   }, [absolutePath, begin]);
   return <>
     <button ref={button} className="re-tool" type="button" data-region-edit="" disabled={loading} aria-pressed={!!capture}
-      title={error || '圈选预览内容，写下修改要求，无需截图。'}
-      onClick={() => { if (capture) close(); else void refresh(); }}>{loading ? '准备中…' : error ? '重试圈选' : '圈选修改'}</button>
+      title={error || (html ? '点选页面元素，写下修改要求。' : '圈选预览内容，写下修改要求，无需截图。')}
+      onClick={() => { if (capture) close(); else void refresh(); }}>{loading ? '准备中…' : error ? '重新选择' : html ? '点选修改' : '圈选修改'}</button>
     {error && <span className="re-inline-error" role="alert">{error}</span>}
     {capture && abort.current && <RegionPicker key={generation} root={capture.root} path={absolutePath} signal={abort.current.signal} onClose={close}
       instruction={instruction} onInstructionChange={setInstruction} hint={hint} onReselect={refresh}
@@ -75,6 +76,7 @@ export function apply(ctx: Host): void {
           try { source = new TextDecoder('utf-8', { fatal: true }).decode(file.data); } catch { /* Layout text is still usable. */ }
         }
         if (!ctx.sidebarRight.isTargetCurrent(target)) throw new Error('当前预览已切换，请重新圈选。');
+        checkPreviewSource(root, source);
         return { root, path, source, target, version: JSON.stringify(stat.version) };
       },
       async recognize(capture: Capture, region: Region, signal: AbortSignal): Promise<Recognition> {
@@ -88,11 +90,12 @@ export function apply(ctx: Host): void {
         if (!ctx.sidebarRight.isTargetCurrent(capture.target)) throw new Error('当前预览已切换，请重新圈选。');
         return parseRecognition(JSON.stringify(unwrap(result)));
       },
-      async submit(capture: Capture, instruction: string, region: Region, selection: Lasso, draft: boolean, signal: AbortSignal, target?: Recognition) {
+      async submit(capture: Capture, instruction: string, region: Region, selection: Selection, draft: boolean, signal: AbortSignal, target?: Recognition) {
         if (!ctx.sidebarRight.isTargetCurrent(capture.target) || !capture.root.isConnected) throw new Error('当前预览已切换，请重新圈选。');
         const deadline = AbortSignal.any([signal, AbortSignal.timeout(8000)]);
         const stat = unwrap(await ctx.remote.workspaceFiles.stat(sessionId, capture.path, deadline));
         if (JSON.stringify(stat.version) !== capture.version) throw new Error('原文件已更新，请刷新预览后重新圈选。');
+        checkPreviewSource(capture.root, capture.source);
         const current = await readRegion(capture.root, selection, deadline);
         if (current.text !== region.text || JSON.stringify(current.elements) !== JSON.stringify(region.elements)
           || JSON.stringify(current.image) !== JSON.stringify(region.image)) throw new Error('选区内容已变化，请重新圈选。');

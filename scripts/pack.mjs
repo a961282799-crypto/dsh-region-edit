@@ -8,7 +8,7 @@ const stage = await mkdtemp(resolve(workspace, 'pack-'));
 if (!stage.startsWith(workspace + sep)) throw new Error('Invalid package staging directory.');
 try {
   const root = resolve(stage, 'package'); await mkdir(root);
-  for (const name of ['package.json', 'dist', 'cordis.patch.yml', 'README.md', 'VALIDATION.md', 'LICENSE']) await cp(resolve(name), resolve(root, name), { recursive: true });
+  for (const name of ['package.json', 'dist', 'cordis.patch.yml', 'README.md', 'VALIDATION.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md']) await cp(resolve(name), resolve(root, name), { recursive: true });
   await mkdir('artifacts', { recursive: true });
   const output = resolve('artifacts', `${pkg.name}-${pkg.version}.tgz`);
   const result = spawnSync('tar', ['-czf', output, '-C', stage, 'package'], { stdio: 'inherit' });

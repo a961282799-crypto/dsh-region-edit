@@ -1,7 +1,7 @@
 {
   "name": "dsh-region-edit",
-  "version": "0.3.4",
-  "description": "DeepSeek Harness 桌面端圈选修改：直接圈选预览内容，无需截图",
+  "version": "0.4.0",
+  "description": "DeepSeek Harness 桌面端点选与圈选修改：结构化定位、关键样式和原文件引用",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/a961282799-crypto/dsh-region-edit#readme",
@@ -9,7 +9,7 @@
   "bugs": { "url": "https://github.com/a961282799-crypto/dsh-region-edit/issues" },
   "main": "./dist/index.js",
   "exports": { ".": "./dist/index.js", "./client": "./dist/client.js", "./package.json": "./package.json" },
-  "files": ["dist", "cordis.patch.yml", "README.md", "VALIDATION.md", "LICENSE"],
+  "files": ["dist", "cordis.patch.yml", "README.md", "VALIDATION.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
   "keywords": ["dsh-plugin", "deepseek-harness", "desktop", "region-edit"],
   "engines": { "node": ">=22" },
   "dsh": {
@@ -42,6 +42,7 @@
     "@types/react": "~18.3.1",
     "@types/react-dom": "~18.3.1",
     "esbuild": "0.28.2",
+    "parse5": "8.0.0",
     "playwright": "1.63.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",

@@ -1,15 +1,19 @@
 import { intersects, validPoints } from './lasso.ts';
 import type { Lasso, Point } from './lasso.ts';
+import type { ElementContext } from './element.ts';
+import type { SourceLocation } from './source-map.ts';
 export interface Box { x: number; y: number; width: number; height: number }
 export interface SelectedElement {
   tag: string; selector: string; text: string; html: string;
   page?: string; cell?: string;
+  context?: ElementContext; sourceKey?: string; source?: SourceLocation;
 }
 export interface Region {
   box: Box; viewport: { width: number; height: number; scrollX: number; scrollY: number };
   text: string; elements: SelectedElement[]; truncated: boolean;
   image?: import('./image.ts').ImageSelection;
   polygon?: Point[];
+  element?: { id: string; parentId?: string };
 }
 export const LIMIT = { text: 6000, elements: 12, nodes: 12000, html: 700 } as const;
 export function boxBetween(a: { x: number; y: number }, b: { x: number; y: number }): Box {
@@ -20,7 +24,7 @@ export function overlaps(a: Box, b: Box): boolean {
     && a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 }
 function rectBox(rect: DOMRect): Box { return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; }
-function selectorOf(element: Element, root: Element): string {
+export function selectorOf(element: Element, root: Element): string {
   const parts: string[] = [];
   for (let node: Element | null = element; node && node !== root && parts.length < 6; node = node.parentElement) {
     if (node.id) { parts.unshift(`#${CSS.escape(node.id)}`); break; }
@@ -28,6 +32,19 @@ function selectorOf(element: Element, root: Element): string {
     parts.unshift(node.localName + (same.length > 1 ? `:nth-of-type(${same.indexOf(node) + 1})` : ''));
   }
   return parts.join(' > ') || root.localName;
+}
+export function elementSnapshot(target: Element, root: Element, text: string): SelectedElement {
+  const clean = target.cloneNode(true) as Element;
+  clean.querySelectorAll('script,style,input,textarea,select').forEach(n => n.remove());
+  if (/^(textarea|select)$/.test(clean.localName)) clean.textContent = '';
+  for (const element of [clean, ...clean.querySelectorAll('*')]) for (const attribute of [...element.attributes]) {
+    if (/^on/i.test(attribute.name) || attribute.name === 'value' || attribute.name.startsWith('data-region-')) element.removeAttribute(attribute.name);
+  }
+  const page = target.closest('[data-page-number],[data-pdf-page]');
+  const cell = target.closest('td,th') as HTMLTableCellElement | null;
+  return { tag: target.localName, selector: selectorOf(target, root), text: text.slice(0, 600), html: clean.outerHTML.slice(0, LIMIT.html),
+    ...(page ? { page: page.getAttribute('data-page-number') ?? page.getAttribute('data-pdf-page') ?? '' } : {}),
+    ...(cell ? { cell: `row ${cell.parentElement ? (cell.parentElement as HTMLTableRowElement).rowIndex + 1 : '?'}, column ${cell.cellIndex + 1}` } : {}) };
 }
 /** Reads layout and text only. No pixels, canvas extraction, form values, or screenshot APIs. */
 export function collectRegion(root: Element, selection: Box | Lasso): Region {
@@ -39,16 +56,7 @@ export function collectRegion(root: Element, selection: Box | Lasso): Region {
   let textLength = 0, visited = 0, truncated = false;
   const addElement = (target: Element, text: string) => {
     if (elements.has(target) || elements.size >= LIMIT.elements) return;
-    const clean = target.cloneNode(true) as Element;
-    clean.querySelectorAll('script,style,input,textarea,select').forEach(n => n.remove());
-    for (const element of [clean, ...clean.querySelectorAll('*')]) for (const attribute of [...element.attributes]) {
-      if (/^on/i.test(attribute.name) || attribute.name === 'value') element.removeAttribute(attribute.name);
-    }
-    const page = target.closest('[data-page-number],[data-pdf-page]');
-    const cell = target.closest('td,th') as HTMLTableCellElement | null;
-    elements.set(target, { tag: target.localName, selector: selectorOf(target, root), text: text.slice(0, 600), html: clean.outerHTML.slice(0, LIMIT.html),
-      ...(page ? { page: page.getAttribute('data-page-number') ?? page.getAttribute('data-pdf-page') ?? '' } : {}),
-      ...(cell ? { cell: `row ${cell.parentElement ? (cell.parentElement as HTMLTableRowElement).rowIndex + 1 : '?'}, column ${cell.cellIndex + 1}` } : {}) });
+    elements.set(target, elementSnapshot(target, root, text));
   };
   const clips = new Map<Element, Box | null>();
   const visibleRect = (rect: DOMRect, element: Element): Box | undefined => {
@@ -150,11 +158,36 @@ export function validRegion(value: unknown): value is Region {
   if (!value || typeof value !== 'object') return false;
   const r = value as Region;
   const box = (b: Box) => b && ['x','y','width','height'].every(k => Number.isFinite(b[k as keyof Box]) && Math.abs(b[k as keyof Box]) < 1e7) && b.width >= 0 && b.height >= 0;
-  return !!box(r.box) && !!r.viewport && ['width','height','scrollX','scrollY'].every(k => Number.isFinite(r.viewport[k as keyof Region['viewport']]))
+  return !!box(r.box) && !!r.viewport && r.viewport.width > 0 && r.viewport.height > 0
+    && ['width','height','scrollX','scrollY'].every(k => Number.isFinite(r.viewport[k as keyof Region['viewport']]) && Math.abs(r.viewport[k as keyof Region['viewport']]) < 1e7)
     && typeof r.text === 'string' && r.text.length <= LIMIT.text && typeof r.truncated === 'boolean' && (r.polygon === undefined || validPoints(r.polygon))
+    && (r.element === undefined || !!r.element && shortString(r.element.id, 64) && (r.element.parentId === undefined || shortString(r.element.parentId, 64)))
     && Array.isArray(r.elements) && r.elements.length <= LIMIT.elements && r.elements.every(e => e && typeof e.tag === 'string' && e.tag.length < 100
       && typeof e.selector === 'string' && e.selector.length < 1500 && typeof e.text === 'string' && e.text.length <= 600
       && typeof e.html === 'string' && e.html.length <= LIMIT.html
+      && (e.sourceKey === undefined || shortString(e.sourceKey, 64)) && (e.context === undefined || validContext(e.context))
       && (e.page === undefined || typeof e.page === 'string' && e.page.length < 100)
       && (e.cell === undefined || typeof e.cell === 'string' && e.cell.length < 100));
+}
+function shortString(value: unknown, max: number): value is string { return typeof value === 'string' && value.length <= max; }
+function stringMap(value: unknown, count: number): value is Record<string, string> {
+  return !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length <= count
+    && Object.entries(value).every(([key, val]) => key.length <= 100 && shortString(val, 300));
+}
+function validContext(c: ElementContext): boolean {
+  return !!c && shortString(c.classes, 1000) && shortString(c.inlineStyle, 700) && stringMap(c.styles, 24) && stringMap(c.variables, 12)
+    && Array.isArray(c.rules) && c.rules.length <= 8 && c.rules.every(r => !!r && shortString(r.selector, 300) && shortString(r.declarations, 700) && (r.file === undefined || shortString(r.file, 4096)))
+    && (c.parent === undefined || !!c.parent && shortString(c.parent.tag, 100) && shortString(c.parent.selector, 1500) && shortString(c.parent.classes, 1000) && stringMap(c.parent.styles, 24));
+}
+/** Copy only validated fields; frame-supplied source locations and extra properties are discarded. */
+export function cleanElement(e: SelectedElement): SelectedElement {
+  const { tag, selector, text, html, page, cell, sourceKey } = e;
+  const copyMap = (map: Record<string, string>) => Object.fromEntries(Object.entries(map));
+  const c = e.context;
+  return { tag, selector, text, html, ...(page === undefined ? {} : { page }), ...(cell === undefined ? {} : { cell }),
+    ...(sourceKey === undefined ? {} : { sourceKey }), ...(c ? { context: {
+      classes: c.classes, inlineStyle: c.inlineStyle, styles: copyMap(c.styles), variables: copyMap(c.variables),
+      rules: c.rules.map(r => ({ selector: r.selector, declarations: r.declarations, ...(r.file === undefined ? {} : { file: r.file }) })),
+      ...(c.parent ? { parent: { tag: c.parent.tag, selector: c.parent.selector, classes: c.parent.classes, styles: copyMap(c.parent.styles) } } : {})
+    } } : {}) };
 }

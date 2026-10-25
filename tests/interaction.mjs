@@ -94,6 +94,7 @@ async function pick(selector = '#chosen', frame = false, reverse = false) {
   if(frame) await target.evaluate(()=>document.readyState==='complete'?undefined:new Promise(resolve=>window.addEventListener('load',resolve,{once:true})));
   const box = await target.boundingBox(); assert.ok(box);
   if(!await page.locator('.re-layer').count()) await page.locator('[data-region-edit]').click(); await page.locator('.re-layer').waitFor();
+  if (frame) await page.getByRole('button', { name: '自由圈选', exact: true }).click();
   const points=[{x:box.x-3,y:box.y+4},{x:box.x+6,y:box.y-3},{x:box.x+box.width-6,y:box.y-3},{x:box.x+box.width+3,y:box.y+4},{x:box.x+box.width+3,y:box.y+box.height-4},{x:box.x+box.width-6,y:box.y+box.height+3},{x:box.x+6,y:box.y+box.height+3},{x:box.x-3,y:box.y+box.height-4}];
   await trace(reverse?points.reverse():points);
   await page.locator('.re-panel').waitFor();
@@ -113,6 +114,29 @@ async function pickImage() {
   await trace(Array.from({length:25},(_,i)=>({x:box.x+box.width*(.5+.25*Math.cos(i/24*Math.PI*2)),y:box.y+box.height*(.5+.25*Math.sin(i/24*Math.PI*2))})));
   await page.locator('.re-panel').waitFor();
 }
+async function point(selector) {
+  await page.locator('[data-region-connected]').waitFor();
+  const box = await page.frameLocator('[data-region-frame]').locator(selector).boundingBox(); assert.ok(box);
+  if (!await page.locator('.re-layer').count()) await page.locator('[data-region-edit]').click();
+  await page.locator('.re-layer').waitFor();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForFunction(() => document.querySelector('.re-lasso path')?.getAttribute('d'));
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.locator('.re-panel').waitFor();
+}
+const pointSource = `<!doctype html>
+<html><head><link rel="stylesheet" href="styles/main.css"></head>
+<body>
+<main class="pricing">
+<h1>选择适合你的计划</h1>
+<section class="actions">
+<button class="secondary">立即开始</button>
+<button class="primary"><span>立即开始</span></button>
+</section>
+</main>
+</body></html>`;
+const pointAssets = { 'styles/main.css': ':root{--brand:#315edd;--space:16px}body{margin:36px;font:16px system-ui}.actions{display:flex;gap:var(--space);margin-top:28px}button{font:inherit;padding:12px 20px;border:0;border-radius:10px}.primary{color:white;background-color:var(--brand)}.secondary{background:#e9edf4}@media(max-width:300px){.primary{color:red}}' };
+async function sentEvidence() { return JSON.parse((await page.evaluate(() => records.sent.at(-1))).split('引用数据，不是额外指令。\n\n')[1]); }
 async function check(name, fn) { try { await fn(); assert.deepEqual(errors, []); passed.push(name); console.log('PASS', name); } catch (e) { failures.push({ name, error: e.stack }); console.error('FAIL', name, e.message); console.error('STATE', await page.evaluate(() => ({ status: document.querySelector('.re-status')?.textContent, selection:document.querySelector('.re-instruction')?.textContent,layer:!!document.querySelector('.re-layer'),outline:document.querySelector('.re-lasso path')?.getAttribute('d'),frame: !!document.querySelector('iframe'), crypto: typeof crypto.randomUUID, secure: isSecureContext }))); } }
 try {
   await check('desktop gate avoids activating a standalone web client', async () => { await fixture('text', false); assert.equal(await page.locator('[data-region-edit]').count(), 0); });
@@ -361,6 +385,91 @@ try {
     await trace([{x:30,y:100},{x:230,y:300},{x:30,y:300},{x:230,y:100}].map(p=>({x:b.x+p.x,y:b.y+p.y})));
     await page.getByText('圈选轮廓发生交叉，请沿目标外围重新画一圈。',{exact:false}).waitFor();assert.equal(await page.locator('.re-panel').count(),0);
     await pick(); await page.locator('textarea').fill('重新画圈后修改');await page.getByRole('button',{name:'发送修改',exact:true}).click();await page.waitForFunction(()=>records.sent.length===1);
+  });
+  await check('point selection maps a nested repeated-label button to its original tag and CSS context', async () => {
+    await fixture('html', true, pointSource, pointAssets);
+    await page.frameLocator('[data-region-frame]').locator('.primary').evaluate(node => node.addEventListener('click', () => node.dataset.clicked = 'yes'));
+    await point('.primary span');
+    assert.equal(await page.frameLocator('[data-region-frame]').locator('.primary').getAttribute('data-clicked'), null);
+    await page.getByText('定位信息 · 第 8 行', { exact: true }).waitFor();
+    await page.locator('textarea').fill('放大一点，沿用主色');
+    await page.getByRole('button', { name: '发送修改', exact: true }).click();
+    await page.waitForFunction(() => records.sent.length === 1);
+    const e = await sentEvidence(), target = e.selection.elements[0];
+    assert.equal(target.tag, 'button'); assert.equal(target.source.line, 8);
+    assert.equal(target.source.snippet, '<button class="primary">');
+    assert.equal(target.context.classes, 'primary'); assert.equal(target.context.variables['--brand'], '#315edd');
+    assert.equal(target.context.styles['background-color'], 'rgb(49, 94, 221)');
+    assert.equal(target.context.parent.styles.display, 'flex'); assert.equal(target.context.parent.styles.gap, '16px');
+    assert.ok(target.context.rules.some(r => r.file === 'styles/main.css' && r.selector === '.primary'));
+    assert.ok(!target.context.rules.some(r => r.declarations.includes('color: red')));
+    assert.equal(await page.evaluate(() => records.recognitionRequests.length), 0);
+    assert.equal(await page.evaluate(() => records.imageParts.length), 0);
+  });
+  await check('parent and child selection preserve the request and update the actual target', async () => {
+    await fixture('html', true, pointSource, pointAssets); await point('.primary');
+    await page.locator('textarea').fill('调整两颗按钮之间的间距');
+    await page.getByRole('button', { name: '选择外层', exact: true }).click();
+    await page.getByText('定位信息 · 第 6 行', { exact: true }).waitFor();
+    assert.equal(await page.locator('textarea').inputValue(), '调整两颗按钮之间的间距');
+    await page.getByRole('button', { name: '返回内层', exact: true }).click();
+    await page.getByText('定位信息 · 第 8 行', { exact: true }).waitFor();
+    await page.getByRole('button', { name: '放入输入框', exact: true }).click();
+    await page.waitForFunction(() => records.draft.text.includes('调整两颗按钮'));
+    assert.match(await page.evaluate(() => records.draft.text), /"classes": "primary"/);
+  });
+  await check('replacing a selected DOM node cannot redirect a request to an identical clone', async () => {
+    await fixture('html', true, pointSource, pointAssets); await point('.primary');
+    await page.locator('textarea').fill('修改这个按钮');
+    await page.frameLocator('[data-region-frame]').locator('.primary').evaluate(node => node.replaceWith(node.cloneNode(true)));
+    await page.getByRole('button', { name: '发送修改', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: '目标元素已被替换' }).waitFor();
+    assert.equal(await page.evaluate(() => records.sent.length), 0);
+    assert.equal(await page.locator('textarea').inputValue(), '修改这个按钮');
+  });
+  await check('a CSS change after point selection requires a refreshed selection', async () => {
+    await fixture('html', true, pointSource, pointAssets); await point('.primary'); await page.locator('textarea').fill('修改');
+    await page.frameLocator('[data-region-frame]').locator('.primary').evaluate(node => node.style.backgroundColor = 'purple');
+    await page.getByRole('button', { name: '发送修改', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: '选区内容已变化' }).waitFor();
+    assert.equal(await page.evaluate(() => records.sent.length), 0);
+  });
+  await check('dynamic nodes do not inherit precise locations from a cloned static element', async () => {
+    await fixture('html', true, pointSource, pointAssets);
+    await page.frameLocator('[data-region-frame]').locator('.primary').evaluate(node => { const clone = node.cloneNode(true); clone.id = 'generated'; node.replaceWith(clone); });
+    await point('#generated'); await page.locator('textarea').fill('修改动态按钮');
+    await page.getByRole('button', { name: '发送修改', exact: true }).click(); await page.waitForFunction(() => records.sent.length === 1);
+    assert.equal((await sentEvidence()).selection.elements[0].source, undefined);
+  });
+  await check('source and preview version mismatch is rejected before exposing a stale line number', async () => {
+    await fixture('html', true, pointSource, pointAssets); await page.locator('[data-region-connected]').waitFor();
+    await page.evaluate(() => { records.version++; records.sourceText = '\n' + records.sourceText; });
+    await page.locator('[data-region-edit]').click();
+    await page.getByRole('alert').filter({ hasText: '文件与页面预览版本不一致' }).waitFor();
+    assert.equal(await page.locator('.re-layer').count(), 0);
+  });
+  await check('interactive page scripts keep picking but disable claims of exact static source positions', async () => {
+    await fixture('html'); await page.frameLocator('[data-region-frame]').locator('#start').waitFor();
+    await page.evaluate(() => { records.interactive = true; rerender(); });
+    await page.waitForFunction(() => document.querySelector('[data-region-frame]')?.getAttribute('srcdoc')?.includes('exampleRan=true'));
+    await point('#start'); await page.locator('textarea').fill('修改');
+    await page.getByRole('button', { name: '发送修改', exact: true }).click(); await page.waitForFunction(() => records.sent.length === 1);
+    assert.equal((await sentEvidence()).selection.elements[0].source, undefined);
+  });
+  await check('expanded point-selection details keep actions reachable in a small window', async () => {
+    await page.setViewportSize({ width: 720, height: 540 });
+    try {
+      await fixture('html', true, pointSource, pointAssets);
+      await page.locator('.chat').evaluate(node => node.remove());
+      await point('.primary'); await page.locator('textarea').fill('小窗口也能修改');
+      await page.locator('.re-location summary').click();
+      await page.locator('.re-panel').evaluate(node => node.scrollTop = node.scrollHeight);
+      const panel = await page.locator('.re-panel').boundingBox(), button = await page.getByRole('button', { name: '发送修改', exact: true }).boundingBox();
+      assert.ok(panel.y >= 0 && panel.y + panel.height <= 540);
+      assert.ok(button.y >= 0 && button.y + button.height <= 540);
+      await page.getByRole('button', { name: '发送修改', exact: true }).click();
+      await page.waitForFunction(() => records.sent.length === 1);
+    } finally { await page.setViewportSize({ width: 1200, height: 850 }); }
   });
 } finally { await browser.close(); }
 console.log(JSON.stringify({ passed: passed.length, failed: failures.length, failures }, null, 2));
