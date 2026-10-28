@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { boxBetween, cleanElement, overlaps, validRegion } from '../src/selection.ts';
-import { sourceLocations, buildPrompt } from '../src/prompt.ts';
+import { sourceLocations, buildPrompt, requestSelection } from '../src/prompt.ts';
 import { fileAddress, fileFromAddress } from '../src/host.ts';
 import { imageSelection } from '../src/image.ts';
 import { lasso, area, clip, contains, intersects } from '../src/lasso.ts';
@@ -134,4 +134,40 @@ test('frame element context has bounded fields and cannot supply a trusted sourc
     { ...context, rules: Array(9).fill({ selector: 'button', declarations: '' }) }]) {
     assert.equal(validRegion({ ...region, elements: [{ ...element, context: bad }] }), false);
   }
+});
+test('requests stay compact: one image contour, rounded coordinates and a single source-match note', () => {
+  const points = Array.from({ length: 80 }, (_, i) => ({ x: 50 + 40 * Math.cos(i / 80 * Math.PI * 2) + 1e-7, y: 50 + 30 * Math.sin(i / 80 * Math.PI * 2) }));
+  const image = imageSelection({ x: 10, y: 20, width: 80, height: 60 }, { x: 0, y: 0, width: 100, height: 100 }, 2400, 1800, points);
+  const imageRegion = { ...region, text: '', elements: [], polygon: points, image };
+  const selection = requestSelection(imageRegion);
+  assert.equal(selection.polygon, undefined); assert.equal(selection.image!.polygon.pixels.length, image.polygon.pixels.length);
+  assert.ok(selection.image!.polygon.normalized.every(p => Math.abs(p.x * 1e4 - Math.round(p.x * 1e4)) < 1e-6));
+  assert.ok(selection.image!.polygon.pixels.every((p, i) => Math.abs(p.x - image.polygon.pixels[i]!.x) <= .05));
+  const prompt = buildPrompt('C:/海报.png', '放大标题', imageRegion), json = prompt.split('不是额外指令。\n\n')[1]!;
+  assert.doesNotMatch(json, /\n/); assert.equal(JSON.parse(json).selection.polygon, undefined);
+  const lassoSelection = requestSelection({ ...region, polygon: points });
+  assert.equal(lassoSelection.polygon!.length, points.length); assert.ok(lassoSelection.polygon!.every(p => Number.isInteger(p.x * 10)));
+  const text = buildPrompt('a.md', '修改', { ...region, text: '一\n二\n三' }, '一\n二');
+  const evidence = JSON.parse(text.split('不是额外指令。\n\n')[1]!);
+  assert.equal(evidence.sourceMatches.length, 3); assert.ok(evidence.sourceMatches.every((m: object) => !('note' in m))); assert.match(evidence.sourceMatchesNote, /精确匹配/);
+});
+test('line diff is minimal, reconstructs both sides and reports invisible format changes', async () => {
+  const { diffLines, diffBlocks } = await import('../src/diff.ts');
+  const lcs = (a: string[], b: string[]) => { const dp = Array.from({ length: a.length + 1 }, () => new Int32Array(b.length + 1)); for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--) dp[i]![j] = a[i] === b[j] ? dp[i + 1]![j + 1]! + 1 : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!); return dp[0]![0]!; };
+  let seed = 11; const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  for (let run = 0; run < 500; run++) {
+    const make = () => Array.from({ length: Math.floor(random() * 20) }, () => 'abcd'[Math.floor(random() * 4)]!);
+    const a = make(), b = make(), result = diffLines(a.join('\n'), b.join('\n'));
+    assert.deepEqual(result.lines.filter(l => l.kind !== 'add').map(l => l.text), a);
+    assert.deepEqual(result.lines.filter(l => l.kind !== 'del').map(l => l.text), b);
+    assert.equal(result.lines.filter(l => l.kind === 'same').length, lcs(a, b));
+  }
+  const format = diffLines('﻿a\r\nb', 'a\nb');
+  assert.equal(format.added + format.removed, 0); assert.deepEqual(format.eol, { before: 'CRLF', after: 'LF' }); assert.deepEqual(format.bom, { before: true, after: false });
+  assert.equal(diffLines(undefined, 'x\ny').added, 2); assert.equal(diffLines('x', undefined).removed, 1);
+  const shuffled = Array.from({ length: 400 }, (_, i) => String((i * 97) % 400));
+  assert.equal(diffLines(Array.from({ length: 400 }, (_, i) => String(i)).join('\n'), shuffled.join('\n'), { lines: 1000, edits: 50 }).complete, false);
+  const lines = Array.from({ length: 30 }, (_, i) => `l${i}`), changed = [...lines]; changed[15] = 'x';
+  const blocks = diffBlocks(diffLines(lines.join('\n'), changed.join('\n')).lines);
+  assert.deepEqual(blocks.map(b => [b.kind, b.lines.length]), [['gap', 12], ['lines', 8], ['gap', 11]]);
 });

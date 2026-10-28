@@ -14,3 +14,15 @@
 .re-history-files{margin:16px 0;border:1px solid var(--dsw-alias-border-l2,#dfe3e9);border-radius:8px;padding:10px 14px;overflow-wrap:anywhere}.re-history-files summary{cursor:pointer}.re-history-files ul{padding-left:18px}.re-history-files li{padding:3px 0}
 .re-history-dialog footer{position:sticky;bottom:-20px;z-index:1;background:var(--dsw-alias-bg-base,#fff);padding-top:14px;padding-bottom:10px;border-top:1px solid var(--dsw-alias-border-l2,#dfe3e9)}.re-history-dialog footer>p{max-width:520px}.re-history-dialog footer>div{display:flex;gap:8px;flex-wrap:wrap}.re-history-empty{padding:40px 0;text-align:center}
 @media(max-width:700px){.re-history-backdrop{padding:8px}.re-history-dialog{padding:14px;max-height:calc(100dvh - 16px)}.re-comparison{grid-template-columns:1fr}.re-compare-side iframe{height:280px}.re-history-tools label{display:flex;flex-direction:column;width:100%}.re-history-tools select{width:100%}}
+
+.re-diff-wide{grid-column:1/-1}.re-diff-note{margin:0;padding:16px;color:var(--dsw-alias-text-secondary,#697383)}
+.re-diff{max-height:440px;overflow:auto;font:12px/1.65 ui-monospace,monospace}
+.re-diff-line{position:relative;display:grid;grid-template-columns:auto auto 1.5em 1fr;min-width:max-content}
+.re-diff-no{min-width:3.5em;padding:0 8px;text-align:right;color:var(--dsw-alias-text-secondary,#697383);user-select:none;border-right:1px solid var(--dsw-alias-border-l2,#dfe3e9)}
+.re-diff-sign{text-align:center;user-select:none}.re-diff-line code{font:inherit;white-space:pre;padding-right:16px}
+.re-diff-line.re-diff-add{background:rgba(46,160,67,.16)}.re-diff-line.re-diff-del{background:rgba(248,81,73,.16)}
+.re-diff-line.re-diff-add .re-diff-sign,.re-diff-count.re-diff-add{color:#2a9d4a}.re-diff-line.re-diff-del .re-diff-sign,.re-diff-count.re-diff-del{color:#d9473f}
+.re-history-dialog .re-diff-gap{display:block;width:100%;border:0;border-radius:0;border-block:1px dashed var(--dsw-alias-border-l2,#dfe3e9);background:var(--dsw-alias-interactive-bg-hover,#f4f6f8);padding:4px 12px;text-align:left;font:12px/1.6 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#697383)}
+.re-diff-meta{font-weight:400;color:var(--dsw-alias-text-secondary,#697383)}
+.re-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.re-history-notice{margin:8px 0;color:var(--dsw-alias-text-secondary,#697383)}

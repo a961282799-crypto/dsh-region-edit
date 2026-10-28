@@ -102,8 +102,8 @@ export async function pickElement(root: HTMLElement, x: number, y: number, signa
     if (!bridge) break;
     const region = await bridge.request({ kind: hover ? 'hover' : 'point',
       x: (x - rect.x) * frame.clientWidth / rect.width, y: (y - rect.y) * frame.clientHeight / rect.height }, signal);
-    if (!region.element) throw new Error('无法定位该元素，请重新选择。');
-    const selection: ElementSelection = { kind: 'element', frame, elementId: region.element.id };
+    if (!hover && !region.element) throw new Error('无法定位该元素，请重新选择。');
+    const selection: ElementSelection = { kind: 'element', frame, elementId: region.element?.id ?? '' };
     return { selection, region, box: elementBox(selection, region) };
   }
   throw new Error('请在预览方式中选择「圈选预览」，再点选页面元素。');

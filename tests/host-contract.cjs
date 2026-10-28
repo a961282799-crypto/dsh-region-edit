@@ -21,6 +21,10 @@ async function main() {
   const source = require('node:fs').readFileSync(require('node:path').join(__dirname,'../dist/index.js'),'utf8');
   const built = await requireTool('esbuild').transform(source,{format:'cjs',target:'node22'});
   const mod={exports:{}};new Function('require','module','exports',built.code)(hostRequire,mod,mod.exports);
+  // Persisted history goes to a temporary directory, never the user's real application data.
+  require('node:fs').mkdirSync(require('node:path').join(process.cwd(),'.work'),{recursive:true});
+  const historyDir=require('node:fs').mkdtempSync(require('node:path').join(process.cwd(),'.work','history-store-'));
+  process.env.DSH_REGION_EDIT_HISTORY_DIR=historyDir;
   const plugin=mod.exports, root=new Context();let ctx;
   const owner=root.plugin(owned=>{ctx=owned;});await owner.await();
   const path='C:/poster.png', file={version:1,bytes:9,absolutePath:path,data:new Uint8Array([137,80,78,71,13,10,26,10,42])};
@@ -46,8 +50,8 @@ async function main() {
     for(const [key,value]of Object.entries(services))ctx.provide(key,value);
     const {default: NativeFs}=hostRequire('@deepseek-ai/dsh-fs-sandbox');
     const fsFiber=ctx.plugin(NativeFs,{cwd:process.cwd(),diffBasisMaxBytes:1024*1024});await fsFiber.await();const nativeFs=ctx.get('fs');
-    const fiber=ctx.plugin(plugin);await fiber.await();const service=ctx.get('regionEdit');assert.ok(service);
-    assert.deepEqual(remoteMethods(service).map(m=>m.method).sort(),['recognize','prepareChange','listChanges','changeDetail','removeChange','restoreChange'].sort());
+    let fiber=ctx.plugin(plugin);await fiber.await();const service=ctx.get('regionEdit');assert.ok(service);
+    assert.deepEqual(remoteMethods(service).map(m=>m.method).sort(),['recognize','prepareChange','listChanges','changeDetail','changeContent','removeChange','restoreChange'].sort());
     assert.ok(/recognize\(agent,\s*request,\s*signal\)/.test(plugin.RegionVision.prototype.recognize.toString()));
     const result=await service.recognize(agent,request,new AbortController().signal);
     assert.deepEqual(result,{...expected,source:'vision'});
@@ -75,7 +79,9 @@ async function main() {
       await ctx.parallel('session/event',editing.session,{type:'turn/end',seq:3,data:{turn:1}});
       for(let i=0;i<100;i++){if((await service.listChanges(editing,signal))[0].state==='ready')break;await new Promise(r=>setTimeout(r,10));}
       const detail=await service.changeDetail(editing,{id:record.id},signal);
-      assert.equal(detail.state,'ready');assert.equal(detail.files.length,2);assert.equal(detail.before.source,original);
+      assert.equal(detail.state,'ready');assert.equal(detail.files.length,2);assert.deepEqual(detail.snapshots,{before:true,after:true});
+      assert.equal((await service.changeContent(editing,{id:record.id,part:'before'},signal)).source,original);
+      assert.match((await service.changeContent(editing,{id:record.id,part:'after'},signal)).source,/新按钮/);
       assert.equal((await service.restoreChange(editing,{id:record.id},signal)).state,'restored');
       assert.deepEqual(await io.readFile(main),Buffer.from(original));assert.equal(await io.readFile(css,'utf8'),'button{padding:12px}');
       // The real backend must refuse a stale version even when called through the plugin.
@@ -89,13 +95,22 @@ async function main() {
       await io.writeFile(css,'human edit');
       assert.match((await service.restoreChange(editing,{id:next.id},signal)).error,/后来又被修改/);
       assert.equal(await io.readFile(css,'utf8'),'human edit');
-      console.log('PASS native sandbox filesystem: actual HTML/CSS restore, exact BOM/CRLF, session events and later-edit conflict refusal');
+      // Finished records are stored and come back after the plugin restarts.
+      const recordsDir=paths.join(historyDir,'records'),saved=async()=>{try{const names=await io.readdir(recordsDir);
+        const texts=await Promise.all(names.filter(n=>n.endsWith('.json')).map(n=>io.readFile(paths.join(recordsDir,n),'utf8')));
+        return texts.length===2&&texts.some(t=>t.includes('"state":"restored"'))&&texts.some(t=>t.includes('后来又被修改'));}catch{return false;}};
+      for(let i=0;i<200&&!await saved();i++)await new Promise(r=>setTimeout(r,10));assert.ok(await saved(),'finished records must be written to the history directory');
+      await fiber.dispose();fiber=ctx.plugin(plugin);await fiber.await();const again=ctx.get('regionEdit');
+      assert.deepEqual((await again.listChanges(editing,signal)).map(r=>r.state).sort(),['ready','restored']);
+      assert.equal((await again.changeContent(editing,{id:record.id,part:'before'},signal)).source,original);
+      assert.match((await again.restoreChange(editing,{id:next.id},signal)).error,/后来又被修改/);assert.equal(await io.readFile(css,'utf8'),'human edit');
+      console.log('PASS native sandbox filesystem: actual HTML/CSS restore, exact BOM/CRLF, session events, later-edit conflict refusal, persisted records after restart');
     } finally {
       assert.ok(paths.resolve(scratch).startsWith(paths.resolve(process.cwd(),'.work')+paths.sep));
       await io.rm(scratch,{recursive:true,force:true});
     }
     await fiber.dispose();assert.equal(ctx.get('regionEdit'),undefined);
     console.log('PASS real host Cordis/Remote/LLM assembly; original image, selected route, capability gate, stale-file refusal, cancellation, disposal');
-  } finally {await owner.dispose();}
+  } finally {await owner.dispose();require('node:fs').rmSync(historyDir,{recursive:true,force:true});}
 }
 main().catch(error=>{console.error(error.stack);process.exitCode=1;});

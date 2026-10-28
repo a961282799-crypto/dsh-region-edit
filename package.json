@@ -1,6 +1,6 @@
 {
   "name": "dsh-region-edit",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "DeepSeek Harness 桌面端点选与圈选修改：源码定位、前后预览与安全回滚",
   "type": "module",
   "license": "MIT",
@@ -11,7 +11,7 @@
   "exports": { ".": "./dist/index.js", "./client": "./dist/client.js", "./package.json": "./package.json" },
   "files": ["dist", "cordis.patch.yml", "README.md", "VALIDATION.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
   "keywords": ["dsh-plugin", "deepseek-harness", "desktop", "region-edit"],
-  "engines": { "node": ">=22" },
+  "engines": { "node": ">=22.18" },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

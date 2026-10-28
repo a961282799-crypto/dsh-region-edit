@@ -13,7 +13,7 @@ import css from './style.css';
 import historyCss from './history-style.css';
 import { HistoryAction } from './history-ui.tsx';
 import { changeMarker } from './changes.ts';
-import type { ChangeApi, ChangeSummary, ChangeDetail } from './changes.ts';
+import type { ChangeApi, ChangeSummary, ChangeDetail, ChangeText, PreviewSnapshot } from './changes.ts';
 
 const HTML_RENDERER = 'dsh-region-edit/html';
 const TEXT_FILE = /\.(?:txt|md|markdown|rst|html?|css|[cm]?js|jsx|tsx?|json|ya?ml|csv|tsv|py|rs|go|java|c|h|cpp|vue|svelte|xml|svg)$/i;
@@ -73,6 +73,8 @@ export function apply(ctx: Host): void {
       history: {
         list: async (signal: AbortSignal) => unwrap(await ctx.connection.rpc.call<ChangeSummary[]>('/api', 'regionEdit/listChanges', { args: { agentId: sessionId } }, signal)),
         detail: async (id: string, signal: AbortSignal) => unwrap(await ctx.connection.rpc.call<ChangeDetail>('/api', 'regionEdit/changeDetail', { args: { agentId: sessionId, request: { id } } }, signal)),
+        snapshot: async (id: string, side: 'before' | 'after', signal: AbortSignal) => unwrap(await ctx.connection.rpc.call<PreviewSnapshot>('/api', 'regionEdit/changeContent', { args: { agentId: sessionId, request: { id, part: side } } }, signal)),
+        texts: async (id: string, signal: AbortSignal) => unwrap(await ctx.connection.rpc.call<ChangeText[]>('/api', 'regionEdit/changeContent', { args: { agentId: sessionId, request: { id, part: 'texts' } } }, signal)),
         remove: async (id: string, signal: AbortSignal) => unwrap(await ctx.connection.rpc.call('/api', 'regionEdit/removeChange', { args: { agentId: sessionId, request: { id } } }, signal)),
         restore: async (id: string, signal: AbortSignal) => unwrap(await ctx.connection.rpc.call<ChangeSummary>('/api', 'regionEdit/restoreChange', { args: { agentId: sessionId, request: { id } } }, signal))
       },

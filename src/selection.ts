@@ -1,4 +1,4 @@
-import { intersects, validPoints } from './lasso.ts';
+import { area, clip, intersects, validPoints } from './lasso.ts';
 import type { Lasso, Point } from './lasso.ts';
 import type { ElementContext } from './element.ts';
 import type { SourceLocation } from './source-map.ts';
@@ -16,6 +16,8 @@ export interface Region {
   element?: { id: string; parentId?: string };
 }
 export const LIMIT = { text: 6000, elements: 12, nodes: 12000, html: 700 } as const;
+/** Graphemes that may have no box of their own: collapsed or hanging spaces and zero-width format characters. */
+const MAY_COLLAPSE = /^[\s\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\uffa0]+$/u;
 export function boxBetween(a: { x: number; y: number }, b: { x: number; y: number }): Box {
   return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(a.x - b.x), height: Math.abs(a.y - b.y) };
 }
@@ -95,6 +97,14 @@ export function collectRegion(root: Element, selection: Box | Lasso): Region {
     if (!hit(rectBox(rect))) return false;
     const visible = visibleRect(rect, element); return !!visible && hit(visible);
   };
+  // A line box wholly inside the selection and unclipped: every visible glyph on it would pass visibleHit.
+  const wholeLine = (rect: DOMRect, element: Element) => {
+    if (rect.width <= 0 || rect.height <= 0) return true;
+    if (rect.x < box.x || rect.y < box.y || rect.right > box.x + box.width || rect.bottom > box.y + box.height) return false;
+    const visible = visibleRect(rect, element), size = rect.width * rect.height;
+    if (!visible || visible.width * visible.height < size * (1 - 1e-9)) return false;
+    return !points || area(clip(points, rectBox(rect))) >= size * (1 - 1e-6);
+  };
   const range = doc.createRange();
   const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
   while (walker.nextNode()) {
@@ -107,10 +117,13 @@ export function collectRegion(root: Element, selection: Box | Lasso): Region {
     // Trim the two boundary lines by actual glyph geometry rather than including an entire paragraph.
     const runs: string[] = []; let run = '';
     const value = node.textContent;
+    // Fast path: when every line lies inside the selection, only graphemes that may lack a box are measured.
+    const whole = rects.every(r => wholeLine(r, parent));
     for (const { index, segment } of segmenter.segment(value)) {
       if (index > 30000) { truncated = true; break; }
-      range.setStart(node, index); range.setEnd(node, index + segment.length);
-      if ([...range.getClientRects()].some(r => visibleHit(r, parent))) run += segment;
+      let selected = whole && !MAY_COLLAPSE.test(segment);
+      if (!selected) { range.setStart(node, index); range.setEnd(node, index + segment.length); selected = [...range.getClientRects()].some(r => visibleHit(r, parent)); }
+      if (selected) run += segment;
       else if (run) { runs.push(run); run = ''; }
     }
     if (run) runs.push(run);

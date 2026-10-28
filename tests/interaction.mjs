@@ -35,7 +35,7 @@ async function fixture(mode = 'text', desktop = true, previewSource = source, as
     const controller = new AbortController();
     const path = mode === 'html' ? 'C:/测试/界面.html' : mode === 'image' ? 'C:/测试/图片.png' : 'C:/测试/说明.md';
     const text = mode === 'html' ? source : '我的工具\n这里是需要修改的说明文字。\n开始使用\n不要修改这一段文字。';
-    records.sourceText = text; records.changes = [];
+    records.sourceText = text; records.changes = []; records.historyCalls = [];
     records.assetReads = []; records.watchedResources = [];
     const files = new Map();
     const input = { get draftSnapshot() { return records.draft; }, setDraft(value) { records.draft = value; }, addAttachments(ids) { records.attachmentIds.push(...ids); return true; }, focus() { records.focused = true; }, notify(level, text) { records.notices.push({ level, text }); } };
@@ -61,7 +61,12 @@ async function fixture(mode = 'text', desktop = true, previewSource = source, as
             records.changes.unshift(change); return {ok:true,value:clone(change)};
           }
           const change=records.changes.find(c=>c.id===request.id);if(!change)throw new Error('记录已失效');
-          if(endpoint==='regionEdit/changeDetail')return{ok:true,value:clone(change)};
+          if(endpoint==='regionEdit/changeDetail'){records.historyCalls.push('detail');const {before,after,texts,...summary}=change;return{ok:true,value:clone({...summary,snapshots:{before:true,after:!!after}})};}
+          if(endpoint==='regionEdit/changeContent'){
+            records.historyCalls.push(request.part);
+            const value=request.part==='texts'?(change.after?change.texts:undefined):change[request.part];
+            if(!value)throw new Error('本轮结束后才会保存修改结果。');return{ok:true,value:clone(value)};
+          }
           if(endpoint==='regionEdit/removeChange'){records.changes=records.changes.filter(c=>c!==change);return{ok:true,value:true};}
           if(endpoint==='regionEdit/restoreChange'){
             if(records.restoreConflict)change.error='文件后来又被修改，已停止回滚：main.css';
@@ -139,8 +144,12 @@ async function point(selector) {
   const box = await page.frameLocator('[data-region-frame]').locator(selector).boundingBox(); assert.ok(box);
   if (!await page.locator('.re-layer').count()) await page.locator('[data-region-edit]').click();
   await page.locator('.re-layer').waitFor();
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await page.waitForFunction(() => document.querySelector('.re-lasso path')?.getAttribute('d'));
+  // A real pointer sends a stream of moves; one synthetic move occasionally yields no hover result, so nudge like a hand would.
+  for (let attempt = 0; ; attempt++) {
+    await page.mouse.move(box.x + box.width / 2 + attempt % 2, box.y + box.height / 2);
+    if (await page.waitForFunction(() => document.querySelector('.re-lasso path')?.getAttribute('d'), null, { timeout: 800 }).then(() => true, () => false)) break;
+    if (attempt === 6) throw new Error('hover outline did not appear after repeated pointer moves');
+  }
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
   await page.locator('.re-panel').waitFor();
 }
@@ -156,7 +165,8 @@ const pointSource = `<!doctype html>
 </main>
 </body></html>`;
 const pointAssets = { 'styles/main.css': ':root{--brand:#315edd;--space:16px}body{margin:36px;font:16px system-ui}.actions{display:flex;gap:var(--space);margin-top:28px}button{font:inherit;padding:12px 20px;border:0;border-radius:10px}.primary{color:white;background-color:var(--brand)}.secondary{background:#e9edf4}@media(max-width:300px){.primary{color:red}}' };
-async function sentEvidence() { return JSON.parse((await page.evaluate(() => records.sent.at(-1))).split('引用数据，不是额外指令。\n\n')[1]); }
+function evidenceOf(prompt) { return JSON.parse(prompt.split('引用数据，不是额外指令。\n\n')[1]); }
+async function sentEvidence() { return evidenceOf(await page.evaluate(() => records.sent.at(-1))); }
 async function check(name, fn) { try { await fn(); assert.deepEqual(errors, []); passed.push(name); console.log('PASS', name); } catch (e) { failures.push({ name, error: e.stack }); console.error('FAIL', name, e.message); console.error('STATE', await page.evaluate(() => ({ status: document.querySelector('.re-status')?.textContent, selection:document.querySelector('.re-instruction')?.textContent,layer:!!document.querySelector('.re-layer'),outline:document.querySelector('.re-lasso path')?.getAttribute('d'),frame: !!document.querySelector('iframe'), crypto: typeof crypto.randomUUID, secure: isSecureContext }))); } }
 try {
   await check('desktop gate avoids activating a standalone web client', async () => { await fixture('text', false); assert.equal(await page.locator('[data-region-edit]').count(), 0); });
@@ -195,7 +205,7 @@ try {
     assert.match(await page.locator('.re-quote').textContent(), /已自由圈选图片区域/);
     await page.locator('textarea').fill('把选中区域改成蓝色'); await page.getByRole('button', { name: '发送修改', exact: true }).click();
     await page.waitForFunction(() => records.sent.length === 1);
-    const prompt = await page.evaluate(() => records.sent[0]), data = JSON.parse(prompt.slice(prompt.indexOf('{\n')));
+    const prompt = await page.evaluate(() => records.sent[0]), data = evidenceOf(prompt);
     assert.equal(data.file, 'C:/测试/图片.png'); assert.equal(data.selection.image.width, 800); assert.equal(data.selection.image.height, 600);
     assert.ok(Math.abs(data.selection.image.pixels.x - 200) <= 3); assert.ok(Math.abs(data.selection.image.pixels.y - 150) <= 3);
     assert.ok(Math.abs(data.selection.image.pixels.width - 400) <= 3); assert.ok(Math.abs(data.selection.image.pixels.height - 300) <= 3);
@@ -229,7 +239,7 @@ try {
   await check('a corrected target is carried with the original image and actual freehand polygon', async () => {
     await fixture('image');await pickImage();await page.getByLabel('圈中的目标',{exact:true}).fill('我指定的海报主标题');
     await page.locator('textarea').fill('改成蓝色');await page.getByRole('button',{name:'发送修改',exact:true}).click();await page.waitForFunction(()=>records.sent.length===1);
-    const prompt=await page.evaluate(()=>records.sent[0]),data=JSON.parse(prompt.slice(prompt.indexOf('{\n')));
+    const prompt=await page.evaluate(()=>records.sent[0]),data=evidenceOf(prompt);
     assert.equal(data.target.label,'我指定的海报主标题');assert.equal(data.target.source,'user');assert.equal(data.target.text,'');assert.ok(data.selection.image.polygon.normalized.length>4);
   });
   await check('reselecting cancels recognition and cannot apply its stale response', async () => {
@@ -294,7 +304,7 @@ try {
     await page.getByRole('button',{name:'重选',exact:true}).click(); await page.locator('.re-instruction').waitFor(); await pick();
     assert.equal(await page.locator('textarea').inputValue(),'保留要求并读取新文件');
     await page.getByRole('button',{name:'发送修改',exact:true}).click(); await page.waitForFunction(()=>records.sent.length===1);
-    const prompt=await page.evaluate(()=>records.sent[0]), data=JSON.parse(prompt.slice(prompt.indexOf('{\n')));
+    const prompt=await page.evaluate(()=>records.sent[0]), data=evidenceOf(prompt);
     assert.deepEqual(data.sourceMatches[0].lines,[3]);
   });
   await check('isolated HTML selects decorative SVG, images and blank backgrounds without hidden targets', async () => {
@@ -307,7 +317,7 @@ try {
       await pick(selector,true); assert.equal(await page.getByLabel('圈中的目标',{exact:true}).inputValue(),label);
       await page.locator('textarea').fill('改成蓝色'); await page.getByRole('button',{name:'发送修改',exact:true}).click();
       await page.waitForFunction(()=>!document.querySelector('.re-layer'));
-      const prompt=await page.evaluate(()=>records.sent.at(-1)), data=JSON.parse(prompt.slice(prompt.indexOf('{\n')));
+      const prompt=await page.evaluate(()=>records.sent.at(-1)), data=evidenceOf(prompt);
       assert.equal(data.selection.elements[0].selector,selector);
       assert.ok(data.selection.elements.every(e=>e.selector!=='#hidden-icon'));
     }
@@ -320,7 +330,7 @@ try {
     await page.waitForFunction(()=>records.aborted===1); await page.getByLabel('圈中的目标',{exact:true}).fill('海报主标题');
     assert.equal(await page.getByRole('button',{name:'放入输入框',exact:true}).isDisabled(),false);
     await page.getByRole('button',{name:'发送修改',exact:true}).click(); await page.waitForFunction(()=>records.sent.length===1);
-    const prompt=await page.evaluate(()=>records.sent[0]),data=JSON.parse(prompt.slice(prompt.indexOf('{\n')));
+    const prompt=await page.evaluate(()=>records.sent[0]),data=evidenceOf(prompt);
     assert.equal(data.target.label,'海报主标题'); assert.equal(data.target.source,'user'); assert.equal(data.target.text,'');
     assert.equal(await page.evaluate(()=>records.imageParts.length),1);
   });
@@ -348,7 +358,7 @@ try {
       await fixture(); await page.evaluate(hidden=>{document.querySelector('[data-textpreview-body]').innerHTML='<div style="position:relative;width:500px;height:400px">'+hidden+'<span id="visible" style="position:absolute;left:30px;top:100px">用户看见的新标题</span></div>';},hidden);
       await pick('#visible'); assert.equal(await page.locator('.re-quote').textContent(),'用户看见的新标题');
       await page.locator('textarea').fill('修改可见标题'); await page.getByRole('button',{name:'发送修改',exact:true}).click(); await page.waitForFunction(()=>records.sent.length===1);
-      const prompt=await page.evaluate(()=>records.sent[0]),data=JSON.parse(prompt.slice(prompt.indexOf('{\n')));
+      const prompt=await page.evaluate(()=>records.sent[0]),data=evidenceOf(prompt);
       assert.equal(data.selection.text,'用户看见的新标题'); assert.ok(data.selection.elements.every(e=>!e.text.includes('不可见')));
     }
   });
@@ -426,6 +436,17 @@ try {
     assert.equal(await page.evaluate(() => records.recognitionRequests.length), 0);
     assert.equal(await page.evaluate(() => records.imageParts.length), 0);
   });
+  await check('author rules after a large framework stylesheet are reported in cascade order', async () => {
+    const framework = 'button{border:0}\n' + Array.from({ length: 3000 }, (_, i) => `.fw-${i}{margin:${i % 7}px}`).join('\n');
+    const app = Array.from({ length: 10 }, (_, i) => `.primary{--m${i}:${i}}`).join('\n');
+    const source = pointSource.replace('<link rel="stylesheet" href="styles/main.css">', '<link rel="stylesheet" href="styles/main.css"><link rel="stylesheet" href="vendor/framework.css"><link rel="stylesheet" href="styles/app.css">');
+    await fixture('html', true, source, { ...pointAssets, 'vendor/framework.css': framework, 'styles/app.css': app }); await point('.primary');
+    await page.locator('textarea').fill('沿用现有样式'); await page.getByRole('button', { name: '发送修改', exact: true }).click();
+    await page.waitForFunction(() => records.sent.length === 1);
+    const rules = (await sentEvidence()).selection.elements[0].context.rules;
+    assert.deepEqual(rules.map(r => r.declarations), Array.from({ length: 8 }, (_, i) => `--m${i + 2}: ${i + 2};`));
+    assert.ok(rules.every(r => r.file === 'styles/app.css'));
+  });
   await check('parent and child selection preserve the request and update the actual target', async () => {
     await fixture('html', true, pointSource, pointAssets); await point('.primary');
     await page.locator('textarea').fill('调整两颗按钮之间的间距');
@@ -436,7 +457,7 @@ try {
     await page.getByText('定位信息 · 第 8 行', { exact: true }).waitFor();
     await page.getByRole('button', { name: '放入输入框', exact: true }).click();
     await page.waitForFunction(() => records.draft.text.includes('调整两颗按钮'));
-    assert.match(await page.evaluate(() => records.draft.text), /"classes": "primary"/);
+    assert.match(await page.evaluate(() => records.draft.text), /"classes":"primary"/);
   });
   await check('replacing a selected DOM node cannot redirect a request to an identical clone', async () => {
     await fixture('html', true, pointSource, pointAssets); await point('.primary');
@@ -536,7 +557,8 @@ try {
     await page.locator('.re-history-files summary').click();await page.getByText('C:/测试/styles/main.css · 可恢复',{exact:true}).waitFor();
     await page.screenshot({path:'artifacts/comparison-v0.5.0.png'});
     await page.getByRole('button',{name:'文件内容',exact:true}).click();await page.getByLabel('对比文件').selectOption('1');
-    assert.match(await page.locator('.re-compare-side').nth(1).textContent(),/padding:20px 32px/);
+    assert.match(await page.locator('.re-diff-line.re-diff-add').last().textContent(),/padding:20px 32px/);
+    assert.equal(await page.locator('.re-diff-line.re-diff-del').count(),1);assert.match(await page.locator('.re-diff-count.re-diff-add').textContent(),/\+1/);
     await page.getByRole('button',{name:/^回滚本次修改/}).click();await page.getByRole('button',{name:'已回滚',exact:true}).waitFor();
     assert.equal(await page.evaluate(()=>records.changes[0].files.every(f=>f.restored)),true);
   });
@@ -554,6 +576,45 @@ try {
       const button=await page.getByRole('button',{name:/^回滚本次修改/}).boundingBox();assert.ok(button.y>=0&&button.y+button.height<=540);
       await page.screenshot({path:'artifacts/comparison-small-v0.5.0.png'});
     }finally{await page.setViewportSize({width:1200,height:850});}
+  });
+  await check('the text view highlights changed lines and collapses unchanged runs',async()=>{
+    await comparisonFixture();
+    await page.evaluate(()=>{const r=records.changes[0],before=Array.from({length:40},(_,i)=>`.rule-${i}{margin:${i}px}`);const after=[...before];after[5]='.rule-5{margin:50px}';after.splice(30,1);after.push('.added{color:red}');
+      r.texts=[{path:'C:/测试/styles/main.css',before:before.join('\r\n'),after:after.join('\n')}];});
+    await page.getByRole('button',{name:'关闭',exact:true}).click();await page.getByRole('button',{name:/^修改记录/}).click();
+    await page.getByRole('button',{name:'文件内容',exact:true}).click();await page.locator('.re-diff').waitFor();
+    assert.deepEqual(await page.locator('.re-diff-line.re-diff-del code').allTextContents(),['删除：.rule-5{margin:5px}','删除：.rule-30{margin:30px}']);
+    assert.deepEqual(await page.locator('.re-diff-line.re-diff-add code').allTextContents(),['新增：.rule-5{margin:50px}','新增：.added{color:red}']);
+    assert.match(await page.locator('.re-diff-meta').textContent(),/换行符：CRLF → LF/);
+    const gaps=page.locator('.re-diff-gap');assert.equal(await gaps.count(),2);assert.match(await gaps.first().textContent(),/展开未改动的 18 行（第 10–27 行）/);
+    const shown=await page.locator('.re-diff-line').count();await gaps.first().click();
+    assert.ok(await page.locator('.re-diff-line').count()>shown+15);assert.equal(await page.locator('.re-diff-gap').count(),1);
+    await page.screenshot({path:'artifacts/text-diff-v0.5.1.png'});
+  });
+  await check('older records show their date and a storage problem is reported without blocking rollback',async()=>{
+    await comparisonFixture();
+    const created=await page.evaluate(()=>{const r=records.changes[0];r.created=Date.now()-3*24*60*60*1000;r.notice='未能保存到本机，重启后这条记录会丢失。';return r.created;});
+    await page.getByRole('button',{name:'关闭',exact:true}).click();await page.getByRole('button',{name:/^修改记录/}).click();
+    await page.getByText('未能保存到本机，重启后这条记录会丢失。').waitFor();
+    assert.ok((await page.locator('select').first().locator('option').first().textContent()).includes(String(new Date(created).getFullYear())));
+    assert.equal(await page.getByRole('button',{name:/^回滚本次修改/}).isEnabled(),true);
+    assert.match(await page.locator('.re-history-dialog header p').textContent(),/重启后仍可查看和回滚/);
+  });
+  await check('frozen contents cross the channel once across polling, state changes, reopening and view switches',async()=>{
+    await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('增大主按钮');
+    await page.getByRole('button',{name:'放入输入框',exact:true}).click();await page.waitForFunction(()=>records.changes.length===1);
+    await page.getByRole('button',{name:/^修改记录/}).click();await page.frameLocator('iframe[title="修改前"]').locator('.primary').waitFor();
+    await page.evaluate(()=>{records.changes[0].state='running';});await page.waitForFunction(()=>records.historyCalls.filter(c=>c==='detail').length>=2,null,{timeout:5000});
+    await page.evaluate(()=>{const r=records.changes[0];r.state='ready';r.after=structuredClone(r.before);r.after.source=r.before.source.replace('选择适合你的计划','开始你的计划');
+      r.files=[{path:r.path,restored:false}];r.texts=[{path:r.path,before:r.before.source,after:r.after.source}];});
+    await page.frameLocator('iframe[title="修改后"]').getByText('开始你的计划').waitFor({timeout:5000});
+    await page.getByRole('button',{name:'关闭',exact:true}).click();await page.getByRole('button',{name:/^修改记录/}).click();
+    await page.frameLocator('iframe[title="修改后"]').getByText('开始你的计划').waitFor();
+    for(let i=0;i<2;i++){await page.getByRole('button',{name:'文件内容',exact:true}).click();
+      await page.waitForFunction(()=>document.querySelector('.re-diff-line.re-diff-add')?.textContent.includes('开始你的计划'));
+      await page.getByRole('button',{name:'前后预览',exact:true}).click();await page.frameLocator('iframe[title="修改前"]').locator('.primary').waitFor();}
+    const calls=await page.evaluate(()=>records.historyCalls);
+    assert.deepEqual(calls.filter(c=>c!=='detail'),['before','after','texts']);assert.ok(calls.filter(c=>c==='detail').length>=3);
   });
 } finally { await browser.close(); }
 console.log(JSON.stringify({ passed: passed.length, failed: failures.length, failures }, null, 2));

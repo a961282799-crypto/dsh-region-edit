@@ -28,19 +28,28 @@ function stylesOf(node: Element): Record<string, string> {
   const style = node.ownerDocument.defaultView!.getComputedStyle(node);
   return Object.fromEntries(STYLE_KEYS.map(key => [key, compact(style.getPropertyValue(key))]));
 }
+const RULE_RESULTS = 8, RULE_SCAN = 20000;
+/** Cheap pre-check before Element.matches: only false positives are allowed, never a missed rule. */
+function candidateTest(node: Element): (selector: string) => boolean {
+  const tokens = [node.localName, ...(node.id ? [`#${CSS.escape(node.id)}`] : []), ...[...node.classList].map(name => `.${CSS.escape(name)}`)].map(t => t.toLowerCase());
+  return selector => { const text = selector.toLowerCase(); return /[*[:]/.test(text) || tokens.some(token => text.includes(token)); };
+}
+/**
+ * The last matching rules in cascade order. Sheets and rules are walked from the end, so author styles loaded
+ * after a large framework (Bootstrap, Tailwind) are reached first, and the walk stops after 8 matches.
+ */
 function rulesOf(node: Element): StyleRule[] {
-  const result: StyleRule[] = [];
-  const view = node.ownerDocument.defaultView!;
+  const found: StyleRule[] = [];
+  const view = node.ownerDocument.defaultView!, candidate = candidateTest(node);
   let visited = 0;
+  const done = () => found.length >= RULE_RESULTS || visited > RULE_SCAN;
   const walk = (rules: CSSRuleList, file?: string) => {
-    for (const rule of rules) {
-      if (++visited > 1000) return;
+    for (let index = rules.length - 1; index >= 0 && !done(); index--) {
+      const rule = rules[index]!; visited++;
       if (rule instanceof view.CSSStyleRule) {
+        if (!candidate(rule.selectorText)) continue;
         try {
-          if (node.matches(rule.selectorText)) {
-            result.push({ selector: rule.selectorText.slice(0, 300), declarations: compact(rule.style.cssText, 700), ...(file ? { file } : {}) });
-            if (result.length > 8) result.shift();
-          }
+          if (node.matches(rule.selectorText)) found.push({ selector: rule.selectorText.slice(0, 300), declarations: compact(rule.style.cssText, 700), ...(file ? { file } : {}) });
         } catch { /* Unsupported selectors are not evidence of a match. */ }
       } else if (rule instanceof view.CSSMediaRule) {
         if (view.matchMedia(rule.conditionText).matches) walk(rule.cssRules, file);
@@ -56,14 +65,15 @@ function rulesOf(node: Element): StyleRule[] {
       }
     }
   };
-  for (const sheet of node.ownerDocument.styleSheets) {
-    if (visited > 1000) break;
+  const sheets = [...node.ownerDocument.styleSheets];
+  for (let index = sheets.length - 1; index >= 0 && !done(); index--) {
+    const sheet = sheets[index]!;
     if (sheet.disabled || sheet.media.mediaText && !view.matchMedia(sheet.media.mediaText).matches) continue;
     const owner = sheet.ownerNode;
     const file = owner instanceof view.Element ? owner.getAttribute('data-region-stylesheet') ?? undefined : undefined;
     try { walk(sheet.cssRules, file); } catch { /* CSSOM access is optional. */ }
   }
-  return result;
+  return found.reverse();
 }
 export function contextOf(node: Element): ElementContext {
   const classes = node.getAttribute('class')?.slice(0, 1000) ?? '';
@@ -124,8 +134,9 @@ export class ElementReader {
     const element = hover ? { tag: node.localName, selector: selectorOf(node, this.doc.documentElement), text: text.slice(0, 600), html: '' }
       : elementSnapshot(node, this.doc.documentElement, text);
     const parent = node.parentElement;
+    // Hover only draws a box; handles are issued on click so browsing a large page cannot exhaust them.
     return { box, viewport: { width: view.innerWidth, height: view.innerHeight, scrollX: view.scrollX, scrollY: view.scrollY },
       text: text.slice(0, 6000), elements: [hover ? element : enrich(element, node)], truncated: !!collected?.truncated || text.length > 6000,
-      element: { id: this.id(node), ...(parent && parent !== this.doc.documentElement ? { parentId: this.id(parent) } : {}) } };
+      ...(hover ? {} : { element: { id: this.id(node), ...(parent && parent !== this.doc.documentElement ? { parentId: this.id(parent) } : {}) } }) };
   }
 }
