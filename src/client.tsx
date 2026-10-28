@@ -10,22 +10,28 @@ import { imageMediaType, parseRecognition } from './recognition.ts';
 import type { Recognition } from './recognition.ts';
 import { checkPreviewSource, readRegion } from './bridge.ts';
 import css from './style.css';
+import historyCss from './history-style.css';
+import { HistoryAction } from './history-ui.tsx';
+import { changeMarker } from './changes.ts';
+import type { ChangeApi, ChangeSummary, ChangeDetail } from './changes.ts';
 
 const HTML_RENDERER = 'dsh-region-edit/html';
 const TEXT_FILE = /\.(?:txt|md|markdown|rst|html?|css|[cm]?js|jsx|tsx?|json|ya?ml|csv|tsv|py|rs|go|java|c|h|cpp|vue|svelte|xml|svg)$/i;
 interface Capture { root: HTMLElement; path: string; source: string; version: string; target: PageTarget }
 interface ActionProps {
   absolutePath: string;
+  history: ChangeApi;
   begin(element: HTMLElement, path: string, signal: AbortSignal): Promise<Capture>;
   recognize(capture: Capture, region: Region, signal: AbortSignal): Promise<Recognition>;
   submit(capture: Capture, instruction: string, region: Region, selection: Selection, draft: boolean, signal: AbortSignal, target?: Recognition): Promise<void>;
 }
-function RegionAction({ absolutePath, begin, recognize, submit }: ActionProps) {
+function RegionAction({ absolutePath, history, begin, recognize, submit }: ActionProps) {
   const button = useRef<HTMLButtonElement>(null), abort = useRef<AbortController | undefined>(undefined);
   const [capture, setCapture] = useState<Capture>(), [loading, setLoading] = useState(false), [error, setError] = useState('');
   const [instruction, setInstruction] = useState(''), [hint, setHint] = useState('');
   const [manualTarget, setManualTarget] = useState<string | undefined>();
   const [generation, setGeneration] = useState(0);
+  const [historyRevision, setHistoryRevision] = useState(0);
   const html = /\.html?$/i.test(absolutePath);
   const close = useCallback(() => { abort.current?.abort(); setCapture(undefined); setLoading(false); setInstruction(''); setManualTarget(undefined); button.current?.focus({ preventScroll: true }); }, []);
   useEffect(() => () => abort.current?.abort(), []);
@@ -44,11 +50,12 @@ function RegionAction({ absolutePath, begin, recognize, submit }: ActionProps) {
       title={error || (html ? '点选页面元素，写下修改要求。' : '圈选预览内容，写下修改要求，无需截图。')}
       onClick={() => { if (capture) close(); else void refresh(); }}>{loading ? '准备中…' : error ? '重新选择' : html ? '点选修改' : '圈选修改'}</button>
     {error && <span className="re-inline-error" role="alert">{error}</span>}
+    {html && <HistoryAction api={history} revision={historyRevision} />}
     {capture && abort.current && <RegionPicker key={generation} root={capture.root} path={absolutePath} signal={abort.current.signal} onClose={close}
       instruction={instruction} onInstructionChange={setInstruction} hint={hint} onReselect={refresh}
       manualTarget={manualTarget} onManualTargetChange={setManualTarget}
       onRecognize={(region, signal) => recognize(capture, region, signal)}
-      onSubmit={(instruction, region, draft, selection, target) => submit(capture, instruction, region, selection, draft, abort.current!.signal, target)} />}
+      onSubmit={async (instruction, region, draft, selection, target) => { try { await submit(capture, instruction, region, selection, draft, abort.current!.signal, target); } finally { setHistoryRevision(n => n + 1); } }} />}
   </>;
 }
 
@@ -57,12 +64,18 @@ export function apply(ctx: Host): void {
   // Desktop uses the shared client loader (platform "web"); this plugin activates only in its desktop shell.
   if (!(globalThis as typeof globalThis & { dshDesktop?: { protocolVersion?: number } }).dshDesktop?.protocolVersion) return;
   ctx.effect(() => {
-    const style = document.createElement('style'); style.dataset.plugin = 'dsh-region-edit'; style.textContent = css; document.head.append(style);
+    const style = document.createElement('style'); style.dataset.plugin = 'dsh-region-edit'; style.textContent = css + '\n' + historyCss; document.head.append(style);
     return () => style.remove();
   });
   ctx.slots.inject('sidebar.right.tab.document.actions', () => ctx.slots.register({
     name: 'sidebar.right.tab.document.actions', id: 'dsh-region-edit', order: 20,
     inject: sessionId => ({
+      history: {
+        list: async (signal: AbortSignal) => unwrap(await ctx.connection.rpc.call<ChangeSummary[]>('/api', 'regionEdit/listChanges', { args: { agentId: sessionId } }, signal)),
+        detail: async (id: string, signal: AbortSignal) => unwrap(await ctx.connection.rpc.call<ChangeDetail>('/api', 'regionEdit/changeDetail', { args: { agentId: sessionId, request: { id } } }, signal)),
+        remove: async (id: string, signal: AbortSignal) => unwrap(await ctx.connection.rpc.call('/api', 'regionEdit/removeChange', { args: { agentId: sessionId, request: { id } } }, signal)),
+        restore: async (id: string, signal: AbortSignal) => unwrap(await ctx.connection.rpc.call<ChangeSummary>('/api', 'regionEdit/restoreChange', { args: { agentId: sessionId, request: { id } } }, signal))
+      },
       async begin(element: HTMLElement, path: string, signal: AbortSignal): Promise<Capture> {
         const root = element.closest('[data-textpreview-url]')?.querySelector<HTMLElement>('[data-textpreview-body]');
         const target = ctx.sidebarRight.focusedTarget(element);
@@ -103,7 +116,7 @@ export function apply(ctx: Host): void {
         if (!ctx.sidebarRight.isTargetCurrent(capture.target)) throw new Error('当前预览已切换，请重新圈选。');
         const scope = ctx.sessions.scope(sessionId), conversation = scope?.get('conversation');
         if (!scope || !conversation) throw new Error('当前会话不可用，请重新打开会话。');
-        const prompt = buildPrompt(capture.path, instruction, region, capture.source, target);
+        let prompt = buildPrompt(capture.path, instruction, region, capture.source, target);
         const mediaType = region.image && imageMediaType(capture.path);
         const attachments: string[] = [];
         if (mediaType) {
@@ -114,14 +127,21 @@ export function apply(ctx: Host): void {
           if (!ctx.sidebarRight.isTargetCurrent(capture.target)) throw new Error('当前预览已切换，请重新圈选。');
           attachments.push(...conversation.createDrafts(sessionId, [original]).map(a => a.id));
         }
-        let staged = false;
+        let staged = false, change: ChangeSummary | undefined, delivered = false;
         try {
+        if (/\.html?$/i.test(capture.path)) {
+          change = unwrap(await ctx.connection.rpc.call<ChangeSummary>('/api', 'regionEdit/prepareChange', { args: { agentId: sessionId, request: { path: capture.path, version: capture.version, instruction } } }, signal));
+          prompt = `${changeMarker(change.id)}\n\n${prompt}`;
+          signal.throwIfAborted();
+          if (!ctx.sidebarRight.isTargetCurrent(capture.target)) throw new Error('当前预览已切换，请重新选择。');
+        }
         if (draft) {
           const input = conversation.input.for(scope);
           const previous = input.draftSnapshot;
           if (attachments.length && !input.addAttachments(attachments)) throw new Error('聊天输入框正在提交，请稍后重试。');
           input.setDraft({ ...previous, text: previous.text ? `${previous.text}\n\n${prompt}` : prompt });
           staged = true;
+          delivered = true;
           requestAnimationFrame(() => input.focus());
         } else {
           if (attachments.length) {
@@ -129,9 +149,13 @@ export function apply(ctx: Host): void {
             if (!session) throw new Error('当前会话不可用，请重新打开会话。');
             if ((await conversation.sendSession(session, prompt, attachments, 'queue', signal)).kind !== 'success') throw new Error('图片修改请求没有发送成功，请重试。');
           } else await conversation.send(prompt);
+          delivered = true;
           conversation.input.for(scope).notify('info', '圈选修改要求已发送。');
         }
-        } finally { if (!staged) for (const id of attachments) conversation.releaseDraftAttachment(id); }
+        } finally {
+          if (!staged) for (const id of attachments) conversation.releaseDraftAttachment(id);
+          if (change && !delivered) await ctx.connection.rpc.call('/api', 'regionEdit/removeChange', { args: { agentId: sessionId, request: { id: change.id } } }, AbortSignal.timeout(8000)).catch(() => {});
+        }
       }
     })
   }, RegionAction));

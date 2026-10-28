@@ -4,16 +4,22 @@ import { imageMediaType, parseRecognition, recognitionPrompt, recognitionSystem 
 import { validPoints } from './lasso.ts';
 import type { ImageSelection } from './image.ts';
 import type { FileStat } from './host.ts';
+import { EditHistory } from './history.ts';
+import type { HistoryHost, HistorySession, FsTarget } from './history.ts';
 export interface Route { provider: string; model: string }
 export interface Agent { session: { id: string; header: { cwd?: string }; requestHeader(): { config: Route } | undefined } }
-export interface ServerHost {
+export interface ServerHost extends HistoryHost {
+  on(name: 'session/event', listener: (session: HistorySession, event: { type: string; seq: number; data: unknown }) => void): unknown;
+  on(name: 'session/disposed', listener: (session: HistorySession) => void): unknown;
+  on(name: 'tools/pre-execute', listener: (exec: { agent?: { session: HistorySession }; signal: AbortSignal }, next: () => Promise<unknown>) => Promise<unknown>): unknown;
+  on(name: 'fs/write-intent' | 'fs/edit-intent', listener: (target: FsTarget, exec: { agent?: { session: HistorySession }; signal: AbortSignal } | undefined, next: () => Promise<unknown>) => Promise<unknown>): unknown;
   effect(callback: () => (() => void)): void;
   workspaceFiles: {
     stat(scope: { workspaceRoot: string }, path: string, signal: AbortSignal): Promise<FileStat>;
     readBytes(scope: { workspaceRoot: string }, path: string, options: object, signal: AbortSignal): Promise<FileStat & { data: Uint8Array }>;
   };
   attachments: { imageLimits: { maxImageBytes: number }; saveImage(input: { data: Uint8Array; mediaType: string; name: string }): Promise<unknown> };
-  sessionProjections: { stateOf(session: Agent['session'], key: string): { pending?: Route | null } | undefined };
+  sessionProjections: { stateOf(session: HistorySession, key: string): { pending?: Route | null; lastTurn?: number; openTurnStartSeq?: number | null } | undefined };
   agentDefaultModel: { currentSelection(): Route };
   llm: { prepareCall(route: Route & { maxTokens: number }, signal: AbortSignal): Promise<{
     config: Route; inputModalities?: readonly string[];
@@ -21,11 +27,35 @@ export interface ServerHost {
   }> };
 }
 export interface RecognitionRequest { path: string; version: string; image: ImageSelection }
-export const inject = ['workspaceFiles', 'llm', 'attachments', 'sessionProjections', 'agentDefaultModel'];
+export const inject = ['workspaceFiles', 'llm', 'attachments', 'sessionProjections', 'agentDefaultModel', 'fs', 'sandboxPolicy', 'workspaceChanges'];
 export class RegionVision extends TypertRemoteService {
   declare readonly ctx: ServerHost;
   private lifetime = new AbortController();
-  constructor(ctx: ServerHost) { super(ctx, 'regionEdit'); ctx.effect(() => () => this.lifetime.abort()); }
+  private history: EditHistory;
+  constructor(ctx: ServerHost) {
+    super(ctx, 'regionEdit'); this.history = new EditHistory(ctx);
+    ctx.effect(() => () => { this.lifetime.abort(); this.history.dispose(); });
+    ctx.on('session/event', (session, event) => this.history.event(session, event));
+    ctx.on('session/disposed', session => this.history.forget(session));
+    ctx.on('tools/pre-execute', async (exec, next) => { if (exec.agent) await this.history.beforeTool(exec.agent.session, exec.signal); return next(); });
+    for (const name of ['fs/write-intent', 'fs/edit-intent'] as const) ctx.on(name, async (target, exec, next) => {
+      const intent = await next();
+      if (exec?.agent) await this.history.beforeMutation(exec.agent.session, target, exec.signal);
+      return intent;
+    });
+  }
+  @Remote
+  async prepareChange(agent: Agent, request: { path: string; version: string; instruction: string }, signal: AbortSignal) {
+    return this.history.prepare(agent.session, request, signal);
+  }
+  @Remote
+  async listChanges(agent: Agent, signal: AbortSignal) { signal.throwIfAborted(); return this.history.list(agent.session); }
+  @Remote
+  async changeDetail(agent: Agent, request: { id: string }, signal: AbortSignal) { signal.throwIfAborted(); return this.history.detail(agent.session, request?.id); }
+  @Remote
+  async removeChange(agent: Agent, request: { id: string }, signal: AbortSignal) { signal.throwIfAborted(); this.history.remove(agent.session, request?.id); return true; }
+  @Remote
+  async restoreChange(agent: Agent, request: { id: string }, signal: AbortSignal) { return this.history.restore(agent.session, request?.id, signal); }
   // Keep parameter names: the host's SRC Remote protocol reads agent/request/signal.
   @Remote
   async recognize(agent: Agent, request: RecognitionRequest, signal: AbortSignal) {

@@ -35,7 +35,7 @@ async function fixture(mode = 'text', desktop = true, previewSource = source, as
     const controller = new AbortController();
     const path = mode === 'html' ? 'C:/测试/界面.html' : mode === 'image' ? 'C:/测试/图片.png' : 'C:/测试/说明.md';
     const text = mode === 'html' ? source : '我的工具\n这里是需要修改的说明文字。\n开始使用\n不要修改这一段文字。';
-    records.sourceText = text;
+    records.sourceText = text; records.changes = [];
     records.assetReads = []; records.watchedResources = [];
     const files = new Map();
     const input = { get draftSnapshot() { return records.draft; }, setDraft(value) { records.draft = value; }, addAttachments(ids) { records.attachmentIds.push(...ids); return true; }, focus() { records.focused = true; }, notify(level, text) { records.notices.push({ level, text }); } };
@@ -50,6 +50,26 @@ async function fixture(mode = 'text', desktop = true, previewSource = source, as
           if(options?.baseFile){records.assetReads.push(reference);if(!(reference in assets))throw new Error('Missing fixture asset: '+reference);const value=assets[reference];return {ok:true,value:{data:typeof value==='string'?new TextEncoder().encode(value):new Uint8Array(value),version:1,absolutePath:'C:/测试/'+reference}};}
           return { ok: true, value: { data: mode==='image'?new Uint8Array([137,80,78,71,13,10,26,10,42]):new TextEncoder().encode(records.sourceText), version: records.version, absolutePath: path } }; } } },
       connection: { rpc: { async call(channel, endpoint, payload, signal) {
+        if (endpoint !== 'regionEdit/recognize') {
+          if(channel!=='/api'||Object.keys(payload).length!==1||payload.args?.agentId!=='qa') throw new Error('Unexpected history RPC envelope');
+          const request=payload.args.request, clone=value=>structuredClone(value);
+          if(endpoint==='regionEdit/listChanges') return {ok:true,value:clone(records.changes)};
+          if(endpoint==='regionEdit/prepareChange') {
+            if(records.historyFail) throw new Error('无法保存修改前的文件');
+            const change={id:'change-'+(records.changes.length+1),path,created:Date.now(),instruction:request.instruction,state:'prepared',files:[],problems:[],texts:[],
+              before:{source:records.sourceText,assets:Object.entries(assets).map(([reference,data])=>({reference,data:typeof data==='string'?new TextEncoder().encode(data):new Uint8Array(data)}))}};
+            records.changes.unshift(change); return {ok:true,value:clone(change)};
+          }
+          const change=records.changes.find(c=>c.id===request.id);if(!change)throw new Error('记录已失效');
+          if(endpoint==='regionEdit/changeDetail')return{ok:true,value:clone(change)};
+          if(endpoint==='regionEdit/removeChange'){records.changes=records.changes.filter(c=>c!==change);return{ok:true,value:true};}
+          if(endpoint==='regionEdit/restoreChange'){
+            if(records.restoreConflict)change.error='文件后来又被修改，已停止回滚：main.css';
+            else{change.state='restored';change.files.forEach(f=>f.restored=true);delete change.error;}
+            return{ok:true,value:clone(change)};
+          }
+          throw new Error('Unexpected history method');
+        }
         if(channel!=='/api'||endpoint!=='regionEdit/recognize'||Object.keys(payload).length!==1||!payload.args||payload.args.agentId!=='qa') throw new Error('Unexpected RPC envelope'); records.recognitionRequests.push(payload.args);
         if(records.recognitionDelay) await new Promise((resolve,reject)=>{const timer=setTimeout(resolve,records.recognitionDelay);signal.addEventListener('abort',()=>{records.aborted++;if(!records.recognitionIgnoresAbort){clearTimeout(timer);reject(new Error('aborted'));}},{once:true});});
         if(records.recognitionFail) return {ok:false,error:{code:'test',message:'测试：视觉识别失败'}};
@@ -470,6 +490,70 @@ try {
       await page.getByRole('button', { name: '发送修改', exact: true }).click();
       await page.waitForFunction(() => records.sent.length === 1);
     } finally { await page.setViewportSize({ width: 1200, height: 850 }); }
+  });
+  await check('HTML requests save a session record before staging and can remove an unsent record', async () => {
+    await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('增大按钮');
+    await page.getByRole('button',{name:'放入输入框',exact:true}).click();
+    await page.waitForFunction(()=>records.draft.text.includes('[dsh-region-edit:'));
+    assert.match(await page.evaluate(()=>records.draft.text),/\[dsh-region-edit:change-1\]/);
+    await page.getByRole('button',{name:/^修改记录/}).click();await page.getByRole('dialog').waitFor();
+    await page.getByText('等待开始',{exact:true}).waitFor();
+    assert.equal(await page.getByRole('button',{name:/^回滚本次/}).isDisabled(),true);
+    await page.getByRole('button',{name:'移除记录',exact:true}).click();
+    await page.getByRole('button',{name:'确认移除记录（不改文件）',exact:true}).click();
+    await page.getByText(/还没有修改记录/).waitFor();assert.equal(await page.evaluate(()=>records.sent.length),0);
+    await page.keyboard.press('Escape');await page.getByRole('dialog').waitFor({state:'hidden'});
+  });
+  await check('failed baseline capture prevents delivery and keeps the user instruction', async () => {
+    await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('保留我的要求');
+    await page.evaluate(()=>records.historyFail=true);await page.getByRole('button',{name:'发送修改',exact:true}).click();
+    await page.getByRole('alert').filter({hasText:'无法保存修改前的文件'}).waitFor();
+    assert.equal(await page.evaluate(()=>records.sent.length),0);assert.equal(await page.locator('textarea').inputValue(),'保留我的要求');
+  });
+  await check('failed delivery removes its unused baseline so retry can create a fresh record', async () => {
+    await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('重试修改');
+    await page.evaluate(()=>records.fail=true);await page.getByRole('button',{name:'发送修改',exact:true}).click();
+    await page.getByRole('alert').filter({hasText:'发送失败'}).waitFor();assert.equal(await page.evaluate(()=>records.changes.length),0);
+    await page.evaluate(()=>records.fail=false);await page.getByRole('button',{name:'发送修改',exact:true}).click();await page.waitForFunction(()=>records.sent.length===1);
+    assert.equal(await page.evaluate(()=>records.changes.length),1);
+  });
+  async function comparisonFixture(){
+    await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('增大主按钮，并把标题改成“开始你的计划”');
+    await page.getByRole('button',{name:'发送修改',exact:true}).click();await page.waitForFunction(()=>records.sent.length===1);
+    await page.evaluate(()=>{
+      const r=records.changes[0];r.state='ready';r.after=structuredClone(r.before);r.after.source=r.before.source.replace('选择适合你的计划','开始你的计划');
+      const css=new TextDecoder().decode(r.after.assets[0].data);r.after.assets[0].data=new TextEncoder().encode(css+' .primary{padding:20px 32px;font-size:20px}');
+      r.files=[{path:r.path,restored:false},{path:'C:/测试/styles/main.css',restored:false}];
+      r.texts=[{path:r.path,before:r.before.source,after:r.after.source},{path:'C:/测试/styles/main.css',before:css,after:new TextDecoder().decode(r.after.assets[0].data)}];
+    });
+    await page.getByRole('button',{name:/^修改记录/}).click();await page.frameLocator('iframe[title="修改后"]').locator('h1').waitFor();
+  }
+  await check('comparison freezes both styles, shows changed files and uses opaque scriptless previews', async()=>{
+    await comparisonFixture();
+    assert.equal(await page.frameLocator('iframe[title="修改前"]').locator('.primary').evaluate(n=>getComputedStyle(n).padding),'12px 20px');
+    assert.equal(await page.frameLocator('iframe[title="修改后"]').locator('.primary').evaluate(n=>getComputedStyle(n).padding),'20px 32px');
+    assert.equal(await page.locator('iframe[title="修改前"]').getAttribute('sandbox'),'');
+    await page.locator('.re-history-files summary').click();await page.getByText('C:/测试/styles/main.css · 可恢复',{exact:true}).waitFor();
+    await page.screenshot({path:'artifacts/comparison-v0.5.0.png'});
+    await page.getByRole('button',{name:'文件内容',exact:true}).click();await page.getByLabel('对比文件').selectOption('1');
+    assert.match(await page.locator('.re-compare-side').nth(1).textContent(),/padding:20px 32px/);
+    await page.getByRole('button',{name:/^回滚本次修改/}).click();await page.getByRole('button',{name:'已回滚',exact:true}).waitFor();
+    assert.equal(await page.evaluate(()=>records.changes[0].files.every(f=>f.restored)),true);
+  });
+  await check('a rollback conflict keeps the comparison and exposes the server refusal',async()=>{
+    await comparisonFixture();await page.evaluate(()=>records.restoreConflict=true);await page.getByRole('button',{name:/^回滚本次修改/}).click();
+    await page.getByRole('alert').filter({hasText:'文件后来又被修改'}).waitFor();
+    assert.equal(await page.evaluate(()=>records.changes[0].state),'ready');
+    assert.equal(await page.frameLocator('iframe[title="修改前"]').locator('h1').textContent(),'选择适合你的计划');
+  });
+  await check('comparison dialog fits a small window and keeps rollback reachable',async()=>{
+    await comparisonFixture();await page.setViewportSize({width:640,height:540});
+    try {
+      const dialog=await page.getByRole('dialog').boundingBox();assert.ok(dialog.y>=0&&dialog.y+dialog.height<=540);
+      await page.getByRole('button',{name:/^回滚本次修改/}).scrollIntoViewIfNeeded();
+      const button=await page.getByRole('button',{name:/^回滚本次修改/}).boundingBox();assert.ok(button.y>=0&&button.y+button.height<=540);
+      await page.screenshot({path:'artifacts/comparison-small-v0.5.0.png'});
+    }finally{await page.setViewportSize({width:1200,height:850});}
   });
 } finally { await browser.close(); }
 console.log(JSON.stringify({ passed: passed.length, failed: failures.length, failures }, null, 2));

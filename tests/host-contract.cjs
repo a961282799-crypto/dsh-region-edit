@@ -33,7 +33,9 @@ async function main() {
   const services={
     workspaceFiles:{async stat(){return {...file};},async readBytes(){return {...file};}},
     attachments:{imageLimits:{maxImageBytes:1000},async saveImage(input){stored.push(input);return{attachmentId:'sha256:'+'0'.repeat(64),mediaType:'image/png',bytes:9,width:800,height:600};}},
-    sessionProjections:{stateOf:()=>({pending:{provider:'deepseek-current',model:'current-vision'}})},
+    sessionProjections:{stateOf:(_session,key)=>key==='turnBoundary'?{lastTurn:1,openTurnStartSeq:null}:{pending:{provider:'deepseek-current',model:'current-vision'}}},
+    sandboxPolicy:{defaultMode:'workspace-write',resolve:({session}={})=>({mode:'workspace-write',workspaceRoot:session?.header.cwd??process.cwd()})},
+    workspaceChanges:{summary:()=>undefined},
     agentDefaultModel:{currentSelection:()=>({provider:'default',model:'default-model'})},
     llm:{async prepareCall(config){return{config,inputModalities:modalities,async *stream(options){calls.push(options);
       yield{type:'block-start',index:0,blockType:'text'};yield{type:'text-delta',index:0,text:JSON.stringify(expected)};
@@ -42,8 +44,10 @@ async function main() {
   };
   try {
     for(const [key,value]of Object.entries(services))ctx.provide(key,value);
+    const {default: NativeFs}=hostRequire('@deepseek-ai/dsh-fs-sandbox');
+    const fsFiber=ctx.plugin(NativeFs,{cwd:process.cwd(),diffBasisMaxBytes:1024*1024});await fsFiber.await();const nativeFs=ctx.get('fs');
     const fiber=ctx.plugin(plugin);await fiber.await();const service=ctx.get('regionEdit');assert.ok(service);
-    assert.equal(remoteMethods(service)[0].method,'recognize');
+    assert.deepEqual(remoteMethods(service).map(m=>m.method).sort(),['recognize','prepareChange','listChanges','changeDetail','removeChange','restoreChange'].sort());
     assert.ok(/recognize\(agent,\s*request,\s*signal\)/.test(plugin.RegionVision.prototype.recognize.toString()));
     const result=await service.recognize(agent,request,new AbortController().signal);
     assert.deepEqual(result,{...expected,source:'vision'});
@@ -54,6 +58,42 @@ async function main() {
     modalities=['text'];await assert.rejects(()=>service.recognize(agent,request,new AbortController().signal),/未开放图片输入/);assert.equal(calls.length,1);
     modalities=['text','image'];changeDuringStream=true;await assert.rejects(()=>service.recognize(agent,request,new AbortController().signal),/原图已更新/);
     const controller=new AbortController();controller.abort();await assert.rejects(()=>service.recognize(agent,request,controller.signal));
+    const io=require('node:fs/promises'), paths=require('node:path');
+    const scratch=await io.mkdtemp(paths.join(process.cwd(),'.work','history-host-'));
+    try {
+      const main=paths.join(scratch,'index.html'),css=paths.join(scratch,'main.css');
+      const original='\ufeff<!doctype html>\r\n<link rel="stylesheet" href="main.css"><button>原按钮</button>\r\n';
+      await io.writeFile(main,original);await io.writeFile(css,'button{padding:12px}');
+      const editing={session:{id:'history-qa',header:{cwd:scratch},requestHeader:agent.session.requestHeader}},signal=new AbortController().signal;
+      const target=await nativeFs.resolve(main,{cwd:scratch,signal}), stat=await nativeFs.stat(target,signal);
+      const record=await service.prepareChange(editing,{path:main,version:JSON.stringify(stat.version),instruction:'增大按钮'},signal);
+      assert.equal((await service.listChanges(editing,signal)).length,1);
+      await ctx.parallel('session/event',editing.session,{type:'turn/start',seq:1,data:{turn:1}});
+      await ctx.parallel('session/event',editing.session,{type:'user/message',seq:2,data:{source:{kind:'user'},content:[{type:'text',text:`[dsh-region-edit:${record.id}]`}]}});
+      await ctx.serial('tools/pre-execute',{agent:editing,signal},()=>Promise.resolve());
+      await io.writeFile(main,original.replace('原按钮','新按钮'));await io.writeFile(css,'button{padding:24px}');
+      await ctx.parallel('session/event',editing.session,{type:'turn/end',seq:3,data:{turn:1}});
+      for(let i=0;i<100;i++){if((await service.listChanges(editing,signal))[0].state==='ready')break;await new Promise(r=>setTimeout(r,10));}
+      const detail=await service.changeDetail(editing,{id:record.id},signal);
+      assert.equal(detail.state,'ready');assert.equal(detail.files.length,2);assert.equal(detail.before.source,original);
+      assert.equal((await service.restoreChange(editing,{id:record.id},signal)).state,'restored');
+      assert.deepEqual(await io.readFile(main),Buffer.from(original));assert.equal(await io.readFile(css,'utf8'),'button{padding:12px}');
+      // The real backend must refuse a stale version even when called through the plugin.
+      const next=await service.prepareChange(editing,{path:main,version:JSON.stringify((await nativeFs.stat(target,signal)).version),instruction:'再修改'},signal);
+      await ctx.parallel('session/event',editing.session,{type:'turn/start',seq:4,data:{turn:2}});
+      await ctx.parallel('session/event',editing.session,{type:'user/message',seq:5,data:{content:[{type:'text',text:`[dsh-region-edit:${next.id}]`}]}});
+      await ctx.serial('tools/pre-execute',{agent:editing,signal},()=>Promise.resolve());
+      await io.writeFile(css,'button{padding:30px}');
+      await ctx.parallel('session/event',editing.session,{type:'turn/end',seq:6,data:{turn:2}});
+      for(let i=0;i<100;i++){if((await service.changeDetail(editing,{id:next.id},signal)).state==='ready')break;await new Promise(r=>setTimeout(r,10));}
+      await io.writeFile(css,'human edit');
+      assert.match((await service.restoreChange(editing,{id:next.id},signal)).error,/后来又被修改/);
+      assert.equal(await io.readFile(css,'utf8'),'human edit');
+      console.log('PASS native sandbox filesystem: actual HTML/CSS restore, exact BOM/CRLF, session events and later-edit conflict refusal');
+    } finally {
+      assert.ok(paths.resolve(scratch).startsWith(paths.resolve(process.cwd(),'.work')+paths.sep));
+      await io.rm(scratch,{recursive:true,force:true});
+    }
     await fiber.dispose();assert.equal(ctx.get('regionEdit'),undefined);
     console.log('PASS real host Cordis/Remote/LLM assembly; original image, selected route, capability gate, stale-file refusal, cancellation, disposal');
   } finally {await owner.dispose();}
