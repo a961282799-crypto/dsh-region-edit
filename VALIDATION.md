@@ -1,6 +1,12 @@
 # 验证记录
 
-当前目标宿主：本机 DeepSeek Harness Desktop 0.2.1-rc.3，Windows。v0.3.3 及更早记录对应 rc.2。
+当前目标宿主：DeepSeek Harness Desktop 0.2.1-rc.5，Windows。v0.5.1 至 v0.3.4 记录对应 rc.3，v0.3.3 及更早记录对应 rc.2。
+
+## v0.5.2 适配桌面端 0.2.1-rc.5
+
+2026-10-30：宿主升级到 0.2.1-rc.5 后，v0.5.1 的精确 rc.3 兼容声明会被宿主版本检查拒绝。将宿主、LLM 和 Typert Protocol 兼容声明同步更新到 rc.5，保留精确版本约束，不使用版本豁免。v0.5.1 未发布到 npm，功能与 v0.5.1 相同。
+
+对照 npm 发布的 rc.3 与 rc.5：`@deepseek-ai/dsh` 的依赖集合不变，Cordis 仍为 ~4.0.5。插件用到的三个运行依赖、七个客户端注入包以及 `dsh-app-boot`、`dsh-agent-default-model`、`dsh-fs-sandbox` 中，除 package.json 外只有 `dsh-client-ui-conversation` 有改动：会话头部「更多会话视图」按钮的标签提示框改为按文字宽度显示，并删除 `session.moreViewsCurrent` 文案。插件不使用会话头部 View 标签，无需调整业务流程。
 
 ## v0.5.1 请求精简、记录稳健性、逐行改动与本机保存
 

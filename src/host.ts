@@ -1,4 +1,4 @@
-/** Narrow adapter for the public services verified in Harness Desktop 0.2.1-rc.3. */
+/** Narrow adapter for the public services verified in Harness Desktop 0.2.1-rc.5. */
 export type Result<T> = { ok: true; value: T } | { ok: false; error: { code: string; message: string } };
 export interface Source<T> { getSnapshot(): T; subscribe(listener: () => void): () => void }
 export interface FileStat { version: unknown; bytes?: number; absolutePath: string }

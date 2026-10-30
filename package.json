@@ -1,6 +1,6 @@
 {
   "name": "dsh-region-edit",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "DeepSeek Harness 桌面端点选与圈选修改：源码定位、前后预览与安全回滚",
   "type": "module",
   "license": "MIT",
@@ -27,7 +27,7 @@
       ]
     }
   },
-  "peerDependencies": { "@deepseek-ai/dsh": "0.2.1-rc.3", "@deepseek-ai/dsh-llm": "0.2.1-rc.3", "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.3" },
+  "peerDependencies": { "@deepseek-ai/dsh": "0.2.1-rc.5", "@deepseek-ai/dsh-llm": "0.2.1-rc.5", "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.5" },
   "peerDependenciesMeta": { "@deepseek-ai/dsh": { "optional": true }, "@deepseek-ai/dsh-llm": { "optional": true }, "@deepseek-ai/dsh-typert-protocol": { "optional": true } },
   "scripts": {
     "build": "node scripts/build.mjs",

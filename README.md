@@ -56,12 +56,12 @@ v0.5.0 新增本地 HTML 的 **修改记录、前后预览与一键回滚**。�
 
 ## 安装到桌面版
 
-已适配的桌面版本：**DeepSeek Harness 0.2.1-rc.3 / Windows**（当前工作区插件 v0.5.1）。
+已适配的桌面版本：**DeepSeek Harness 0.2.1-rc.5 / Windows**（当前工作区插件 v0.5.2）。
 
-已构建的安装包和 SHA-256 在 [GitHub 发布页](https://github.com/a961282799-crypto/dsh-region-edit/releases)，同一版本也发布在 npm（`dsh-region-edit`）。自行构建时运行 `npm run pack:plugin`，安装包生成于 `artifacts/dsh-region-edit-0.5.1.tgz`，同目录提供 `SHA256SUMS`。
+已构建的安装包和 SHA-256 在 [GitHub 发布页](https://github.com/a961282799-crypto/dsh-region-edit/releases)，同一版本也发布在 npm（`dsh-region-edit`）。自行构建时运行 `npm run pack:plugin`，安装包生成于 `artifacts/dsh-region-edit-0.5.2.tgz`，同目录提供 `SHA256SUMS`。
 
 ```powershell
-& 'D:\deepseek harness\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop add '插件包的完整路径\dsh-region-edit-0.5.1.tgz'
+& 'D:\deepseek harness\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop add '插件包的完整路径\dsh-region-edit-0.5.2.tgz'
 ```
 
 安装后重新打开桌面客户端。无需修改宿主程序、开启调试端口或启动独立服务。
