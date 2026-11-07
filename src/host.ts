@@ -1,4 +1,4 @@
-/** Narrow adapter for the public services verified in Harness Desktop 0.2.1-rc.5. */
+/** Narrow adapter for the public services verified in Harness Desktop 0.2.2-rc.1. */
 export type Result<T> = { ok: true; value: T } | { ok: false; error: { code: string; message: string } };
 export interface Source<T> { getSnapshot(): T; subscribe(listener: () => void): () => void }
 export interface FileStat { version: unknown; bytes?: number; absolutePath: string }
@@ -34,7 +34,7 @@ export interface Host {
 }
 export interface Conversation {
   send(text: string): Promise<void>;
-  createDrafts(sessionId: string, files: File[]): { id: string }[];
+  createDrafts(sessionId: string, files: File[], uploadImages: boolean): { id: string }[];
   releaseDraftAttachment(id: string): void;
   sendSession(session: unknown, text: string, attachmentIds: string[], mode: 'queue', signal: AbortSignal): Promise<{ kind: string }>;
   input: { for(scope: unknown): {

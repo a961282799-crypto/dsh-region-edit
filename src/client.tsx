@@ -127,7 +127,7 @@ export function apply(ctx: Host): void {
           const original = new File([new Uint8Array(file.data).buffer], capture.path.split(/[\\/]/).pop()!, { type: mediaType });
           signal.throwIfAborted();
           if (!ctx.sidebarRight.isTargetCurrent(capture.target)) throw new Error('当前预览已切换，请重新圈选。');
-          attachments.push(...conversation.createDrafts(sessionId, [original]).map(a => a.id));
+          attachments.push(...conversation.createDrafts(sessionId, [original], false).map(a => a.id));
         }
         let staged = false, change: ChangeSummary | undefined, delivered = false;
         try {

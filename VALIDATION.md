@@ -1,6 +1,18 @@
 # 验证记录
 
-当前目标宿主：DeepSeek Harness Desktop 0.2.1-rc.5，Windows。v0.5.1 至 v0.3.4 记录对应 rc.3，v0.3.3 及更早记录对应 rc.2。
+当前目标宿主：DeepSeek Harness Desktop 0.2.2-rc.1，Windows。v0.5.2 对应 rc.5，v0.5.1 至 v0.3.4 记录对应 rc.3，v0.3.3 及更早记录对应 rc.2。
+
+## v0.5.3 适配桌面端 0.2.2-rc.1
+
+2026-11-04：宿主升级到 0.2.2-rc.1（Cordis 4.1.0），精确的 rc.5 兼容声明会被宿主版本检查拒绝。将宿主、LLM 和 Typert Protocol 的兼容声明同步到 0.2.2-rc.1，保留精确版本约束。
+
+对照 npm 发布的 rc.5 与 0.2.2-rc.1，逐个核对插件用到的接口：
+
+- `Conversation.createDrafts` 新增必填的第三个参数 `uploadImages: boolean`。插件传入 `false`，与旧版“图片内联发送”的行为一致；`src/host.ts` 的窄适配器类型同步更新。
+- `dsh-llm`：`prepareCall(config, signal, configure)` 签名不变；`GenerateOptions` 改为带默认类型参数的泛型，插件不使用 `purpose`，不受影响。
+- `dsh-typert-protocol`：资源声明改为 `field` / `resolve` 二选一的联合类型，插件使用的 `remoteMethods` 不变。
+- `dsh-fs-sandbox`：只新增 `patchText` / `deleteFile` / `moveFile`，插件使用的方法不变。
+- 其余客户端注入包（renderer、sidebar、slots、locale 等）与 `dsh-app-boot` 的插件兼容判断没有影响本插件的改动。
 
 ## v0.5.2 适配桌面端 0.2.1-rc.5
 
