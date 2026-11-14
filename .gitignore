@@ -3,3 +3,5 @@ node_modules/
 artifacts/
 dist/
 /debug.log
+# Promotional video sources (large binaries, kept outside the repository)
+宣传片/

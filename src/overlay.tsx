@@ -13,25 +13,30 @@ export interface PickProps {
   onInstructionChange(value: string): void;
   manualTarget: string | undefined;
   onManualTargetChange(value: string | undefined): void;
+  /** Attach a contour marker drawn on a reduced copy of the original image (images only, off by default). */
+  marked: boolean;
+  onMarkedChange(value: boolean): void;
   onReselect(reason?: string): void;
   onClose(): void;
   onRecognize(region: Region, signal: AbortSignal): Promise<Recognition>;
   onSubmit(instruction: string, region: Region, draft: boolean, selection: Selection, target?: Recognition): Promise<void>;
 }
-export function RegionPicker({ root, path, signal, instruction, hint, onInstructionChange, manualTarget, onManualTargetChange, onReselect, onClose, onRecognize, onSubmit }: PickProps) {
+export function RegionPicker({ root, path, signal, instruction, hint, onInstructionChange, manualTarget, onManualTargetChange, marked, onMarkedChange, onReselect, onClose, onRecognize, onSubmit }: PickProps) {
   const layer = useRef<HTMLDivElement>(null), outline = useRef<SVGPathElement>(null), input = useRef<HTMLTextAreaElement>(null);
   const targetInput = useRef<HTMLInputElement>(null), recognitionController = useRef<AbortController | undefined>(undefined), submitting = useRef(false);
   const drawing = useRef<Point[] | undefined>(undefined), recognize = useRef(onRecognize); recognize.current = onRecognize;
   const [picked, setPicked] = useState<Picked>();
   const html = /\.html?$/i.test(path);
   const [mode, setMode] = useState<'element' | 'lasso'>(html ? 'element' : 'lasso');
-  const [hovered, setHovered] = useState<Picked>(), [parents, setParents] = useState<Picked[]>([]);
+  const [hovered, setHovered] = useState<Picked>();
   const hovering = useRef(false), hoverVersion = useRef(0);
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [target, setTarget] = useState<Recognition | undefined>(() => manualTarget === undefined ? undefined : userTarget(manualTarget));
   const [recognizing, setRecognizing] = useState(false), [recognitionError, setRecognitionError] = useState(''), [attempt, setAttempt] = useState(0);
   const [needsConfirmation, setNeedsConfirmation] = useState(!!manualTarget?.trim());
   const manual = useRef(manualTarget); manual.current = manualTarget;
+  const markedNow = useRef(marked); markedNow.current = marked;
+  const [recognizedMarked, setRecognizedMarked] = useState(marked);
   function userTarget(label: string): Recognition { return { label, kind: '', text: '', confidence: 1, ambiguous: false, source: 'user' }; }
   const bounds = root.getBoundingClientRect();
   useEffect(() => {
@@ -56,7 +61,7 @@ export function RegionPicker({ root, path, signal, instruction, hint, onInstruct
     if (manual.current !== undefined) { setTarget(userTarget(manual.current)); setRecognizing(false); setRecognitionError(''); return; }
     const controller = new AbortController(), requestSignal = AbortSignal.any([signal, controller.signal]);
     recognitionController.current = controller;
-    setRecognizing(true); setRecognitionError(''); setTarget(undefined);
+    setRecognizing(true); setRecognitionError(''); setTarget(undefined); setRecognizedMarked(markedNow.current);
     void recognize.current(picked.region, requestSignal).then(result => { if (!requestSignal.aborted) setTarget(result); })
       .catch(error => { if (!requestSignal.aborted) setRecognitionError((error as Error).message); })
       .finally(() => { if (!requestSignal.aborted) setRecognizing(false); });
@@ -96,8 +101,8 @@ export function RegionPicker({ root, path, signal, instruction, hint, onInstruct
   }
   async function changeLevel(back: boolean) {
     if (!picked || !('kind' in picked.selection)) return;
-    const previous = back ? parents.at(-1) : undefined;
-    const elementId = previous && 'kind' in previous.selection ? previous.selection.elementId : picked.region.element?.parentId;
+    // Inner levels lead back toward the node that was actually clicked.
+    const elementId = back ? picked.region.element?.childId : picked.region.element?.parentId;
     if (!elementId) return;
     setBusy(true); setError('');
     try {
@@ -105,7 +110,6 @@ export function RegionPicker({ root, path, signal, instruction, hint, onInstruct
       const region = await readRegion(root, selection, signal); signal.throwIfAborted();
       const box = elementBox(selection, region);
       onManualTargetChange(undefined); setNeedsConfirmation(false);
-      setParents(stack => back ? stack.slice(0, -1) : [...stack, picked]);
       setPicked({ selection, region, box }); drawBox(box);
     } catch (error) { if (!signal.aborted) setError((error as Error).message); }
     finally { if (!signal.aborted) setBusy(false); }
@@ -174,7 +178,7 @@ export function RegionPicker({ root, path, signal, instruction, hint, onInstruct
         : picked.region.text.slice(0, 120) || picked.region.elements[0]?.text}</blockquote>
       {picked.region.element && <div className="re-levels" role="group" aria-label="调整选择范围">
         <button type="button" disabled={busy || !picked.region.element.parentId} onClick={() => { void changeLevel(false); }}>选择外层</button>
-        <button type="button" disabled={busy || !parents.length} onClick={() => { void changeLevel(true); }}>返回内层</button>
+        <button type="button" disabled={busy || !picked.region.element.childId} onClick={() => { void changeLevel(true); }}>选择内层</button>
       </div>}
       <div className="re-recognition" aria-busy={recognizing}>
         <div className="re-recognition-status" role="status">{recognizing ? picked.region.element ? '正在读取页面元素…' : '正在用当前模型识别圈中对象…' : needsConfirmation ? '已保留原目标，请确认新选区' : target?.source === 'user' && target.label.trim() ? '已采用你指定的目标' : target?.source === 'document' ? picked.region.element ? '已定位页面元素' : '已定位圈内文字与元素' : target?.source === 'vision' ? '视觉识别完成' : '可自行填写圈中目标'}
@@ -185,6 +189,9 @@ export function RegionPicker({ root, path, signal, instruction, hint, onInstruct
         {needsConfirmation && <p className="re-hint">名称来自上次圈选，也可以直接修改。 <button type="button" disabled={busy} onClick={() => setNeedsConfirmation(false)}>确认沿用此目标</button></p>}
         {target?.source === 'vision' && (target.ambiguous || target.confidence < .7) && <p className="re-hint">识别存在歧义，请确认或修改目标名称。</p>}
         {recognitionError && <p className="re-error" role="alert">{recognitionError}</p>}
+        {picked.region.image && <label className="re-check" title="从原图生成一张缩小的标记图，用红框标出圈选轮廓，随识别和修改请求多发送一张图。不是屏幕截图。">
+          <input type="checkbox" checked={marked} disabled={busy} onChange={event => onMarkedChange(event.target.checked)} />
+          附带轮廓标记图，帮助模型定位{target?.source === 'vision' && recognizedMarked !== marked ? <span>（点「重新识别」后用于识别，发送时直接生效）</span> : null}</label>}
       </div>
       <label className="re-label" htmlFor="re-instruction">想把这里改成什么样？</label>
       <textarea ref={input} id="re-instruction" value={instruction} disabled={busy} maxLength={4000} placeholder="例如：缩小标题，改成深灰色，增加下方留白。" onChange={event => onInstructionChange(event.target.value)} />
@@ -210,7 +217,7 @@ function LocationDetails({ region, path }: { region: Region; path: string }) {
       <dl>{Object.entries(context.styles).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl>
       {!!Object.keys(context.variables).length && <><p>沿用的样式变量</p><pre>{Object.entries(context.variables).map(([key, value]) => `${key}: ${value}`).join('\n')}</pre></>}
       {context.parent && <p><strong>外层布局</strong> <code>{context.parent.selector}</code> · {context.parent.styles.display}</p>}
-      {context.rules.map((rule, index) => <div key={index}><p>{rule.file || '内嵌或导入样式（未映射文件）'}</p><pre>{rule.selector}{' {\n'}{rule.declarations}{'\n}'}</pre></div>)}
+      {context.rules.map((rule, index) => <div key={index}><p>{rule.file || '内嵌或导入样式（未映射文件）'}{rule.condition ? ` · ${rule.condition}` : ''}</p><pre>{rule.selector}{' {\n'}{rule.declarations}{'\n}'}</pre></div>)}
       <p>样式为当前视口的计算结果；匹配规则用于辅助定位，不代表唯一生效来源。</p>
     </>}
   </details>;

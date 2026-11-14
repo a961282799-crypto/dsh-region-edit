@@ -4,6 +4,7 @@ declare module 'node:fs/promises' {
   export function readFile(path: string): Promise<Uint8Array>;
   export function readFile(path: string, encoding: 'utf8'): Promise<string>;
   export function readdir(path: string): Promise<string[]>;
+  export function lstat(path: string): Promise<{ mtimeMs: number; isFile(): boolean }>;
   export function rename(from: string, to: string): Promise<void>;
   export function rm(path: string, options: { force: true; recursive?: boolean }): Promise<void>;
   export function stat(path: string): Promise<unknown>;
@@ -14,5 +15,6 @@ declare module 'node:crypto' {
   export function randomUUID(): string;
 }
 declare module 'node:os' { export function homedir(): string; }
+declare module 'node:buffer' { export const Buffer: { compare(a: Uint8Array, b: Uint8Array): number } }
 declare module 'node:path' { export function join(...parts: string[]): string; }
 declare const process: { env: Record<string, string | undefined>; platform: string };

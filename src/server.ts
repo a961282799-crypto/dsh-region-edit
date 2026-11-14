@@ -1,6 +1,6 @@
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol';
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
-import { imageMediaType, parseRecognition, recognitionPrompt, recognitionSystem } from './recognition.ts';
+import { decodeMarker, imageMediaType, parseRecognition, recognitionPrompt, recognitionSystem } from './recognition.ts';
 import { validPoints } from './lasso.ts';
 import type { ImageSelection } from './image.ts';
 import type { FileStat } from './host.ts';
@@ -27,7 +27,8 @@ export interface ServerHost extends HistoryHost {
     stream(options: Route & { messages: unknown[]; system: string; sessionId: string; signal: AbortSignal }): AsyncIterable<unknown>;
   }> };
 }
-export interface RecognitionRequest { path: string; version: string; image: ImageSelection }
+/** `marker`: optional base64 JPEG of the contour drawn on a reduced copy of the original (off unless the user enables it). */
+export interface RecognitionRequest { path: string; version: string; image: ImageSelection; marker?: string }
 export const inject = ['workspaceFiles', 'llm', 'attachments', 'sessionProjections', 'agentDefaultModel', 'fs', 'sandboxPolicy', 'workspaceChanges'];
 export class RegionVision extends TypertRemoteService {
   declare readonly ctx: ServerHost;
@@ -92,6 +93,8 @@ export class RegionVision extends TypertRemoteService {
       || !request.image || !validPoints(request.image.polygon?.normalized)
       || request.image.polygon.normalized.some(p => p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1)
       || ![request.image.width, request.image.height].every(n => Number.isFinite(n) && n > 0 && n < 100000)) throw new Error('自由选区数据无效，请重新圈选。');
+    const marker = request.marker === undefined ? undefined : decodeMarker(request.marker);
+    if (request.marker !== undefined && !marker) throw new Error('轮廓标记图无效，请重新识别。');
     const mediaType = imageMediaType(request.path);
     if (!mediaType) throw new Error('当前视觉通道支持 PNG、JPEG、WebP 和 GIF，可以自行填写这个文件中的目标。');
     const deadline = AbortSignal.any([signal, this.lifetime.signal, AbortSignal.timeout(60000)]);
@@ -105,8 +108,12 @@ export class RegionVision extends TypertRemoteService {
     const call = await this.ctx.llm.prepareCall({ provider: route.provider, model: route.model, maxTokens: 1600 }, deadline);
     if (call.inputModalities && !call.inputModalities.includes('image')) throw new Error('当前选择的模型未开放图片输入，请切换到视觉模型，或自行填写目标。');
     const attachment = await this.image(scope, request.path, request.version, mediaType, deadline, check);
+    if (marker && marker.byteLength > this.ctx.attachments.imageLimits.maxImageBytes) throw new Error('轮廓标记图超过当前视觉输入大小限制。');
+    const markerAttachment = marker && await this.ctx.attachments.saveImage({ data: marker, mediaType: 'image/jpeg', name: '选区标记.jpg' });
+    deadline.throwIfAborted();
     const messages = [createUserMessage({ source: { kind: 'dsh-region-edit' }, content: [
-      { type: 'image', attachment }, { type: 'text', text: recognitionPrompt(request.image) }
+      { type: 'image', attachment }, ...(markerAttachment ? [{ type: 'image', attachment: markerAttachment }] : []),
+      { type: 'text', text: recognitionPrompt(request.image, !!markerAttachment) }
     ] })];
     const assembler = new BlockAssembler();
     for await (const chunk of call.stream({ ...call.config, messages, system: recognitionSystem, sessionId: agent.session.id, signal: deadline })) { deadline.throwIfAborted(); assembler.push(chunk); }

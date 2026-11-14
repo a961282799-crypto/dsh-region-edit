@@ -34,6 +34,30 @@ export function imageSourceMime(src: string): string | undefined {
   const mime = isLocalReference(src) ? MIME_TYPES[extensionOf(src)] : undefined;
   return mime?.startsWith('image/') ? mime : undefined;
 }
+/** Candidates of a `srcset` attribute, in order. URLs may contain commas; a candidate ends at whitespace. */
+export function parseSrcset(srcset: string): { url: string; descriptor: string }[] {
+  const candidates: { url: string; descriptor: string }[] = [];
+  let i = 0;
+  while (i < srcset.length) {
+    while (i < srcset.length && /[\s,]/.test(srcset[i]!)) i++;
+    const start = i; while (i < srcset.length && !/\s/.test(srcset[i]!)) i++;
+    let url = srcset.slice(start, i), descriptor = '';
+    if (!url) break;
+    if (url.endsWith(',')) url = url.replace(/,+$/, '');
+    else { const end = srcset.indexOf(',', i); descriptor = srcset.slice(i, end < 0 ? srcset.length : end).trim(); i = end < 0 ? srcset.length : end + 1; }
+    if (url) candidates.push({ url, descriptor });
+  }
+  return candidates;
+}
+/**
+ * The local file a static preview shows for `<img>`: its src, or for a srcset-only image the 1x candidate (else the
+ * first one). Undefined when the preview does not embed an image.
+ */
+export function imageReference(src: string, srcset: string): string | undefined {
+  if (src) return imageSourceMime(src) ? src : undefined;
+  const candidates = parseSrcset(srcset), chosen = candidates.find(c => !c.descriptor || c.descriptor === '1x') ?? candidates[0];
+  return chosen && imageSourceMime(chosen.url) ? chosen.url : undefined;
+}
 /** A CSS url() or @import target: a nested stylesheet, an embedded asset, or nothing to load. */
 export function cssResource(url: string, imported: boolean): { kind: 'stylesheet' } | { kind: 'asset'; mime: string } | undefined {
   if (!isLocalReference(url)) return;

@@ -12,7 +12,7 @@ const react = await readFile(resolve(dirname(requireTool.resolve('react/package.
 const reactDom = await readFile(resolve(dirname(requireTool.resolve('react-dom/package.json')), 'umd/react-dom.development.js'), 'utf8');
 const plugin = await readFile('dist/client.js', 'utf8');
 const source = `<!doctype html><html><head><style>body{font:16px system-ui;padding:32px;margin:0}button{font:inherit;padding:12px 22px;background:#202a35;color:white;border:0;border-radius:7px}h2{margin:0 0 24px}p{margin:20px 0}</style></head><body><h2>我的工具</h2><p id="chosen">这里是需要修改的说明文字。</p><button id="start">开始使用</button><p id="other">不要修改这一段文字。</p><script>window.exampleRan=true</script></body></html>`;
-async function fixture(mode = 'text', desktop = true, previewSource = source, assets = {}) {
+async function fixture(mode = 'text', desktop = true, previewSource = source, assets = {}, options = {}) {
   errors.length = 0;
   await page.goto('about:blank');
   await page.setContent('<!doctype html><style>body{margin:0;background:#f7f8fa;font:14px system-ui}.app{display:flex;height:850px}.chat{width:460px;padding:30px;background:white}.preview{margin:36px 20px 36px 0;width:680px;height:760px;border:1px solid #ddd;background:white;display:flex;flex-direction:column}header{padding:10px;border-bottom:1px solid #eee;display:flex;align-items:center;justify-content:space-between}.body{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column}.text{padding:32px;font-size:16px}.text p{margin:24px 0}.text h2{margin-top:0}</style><div id="app"></div>');
@@ -29,14 +29,14 @@ async function fixture(mode = 'text', desktop = true, previewSource = source, as
     }); } };
   }, desktop);
   await page.addScriptTag({ content: plugin });
-  await page.evaluate(({ mode, source, assets }) => {
+  await page.evaluate(({ mode, source, assets, options }) => {
     const records = window.records = { sent: [], notices: [], draft: { text: '原有草稿', references: [{ offset: 0, clipboardText: '原有草稿', source: 'test' }] },
       version: 1, current: true, fail: false, interactive: false, reads: 0, registrations: [], disposers: [], recognitionRequests: [], recognitionFail: false, recognitionDelay: 0, aborted: 0, imageParts: [], attachmentIds: ['existing-image'] };
     const controller = new AbortController();
     const path = mode === 'html' ? 'C:/测试/界面.html' : mode === 'image' ? 'C:/测试/图片.png' : 'C:/测试/说明.md';
     const text = mode === 'html' ? source : '我的工具\n这里是需要修改的说明文字。\n开始使用\n不要修改这一段文字。';
     records.sourceText = text; records.changes = []; records.historyCalls = [];
-    records.assetReads = []; records.watchedResources = [];
+    records.assetReads = []; records.watchedResources = []; records.assetDelay = options.assetDelay ?? 0; records.inflight = 0; records.maxInflight = 0;
     const files = new Map();
     const input = { get draftSnapshot() { return records.draft; }, setDraft(value) { records.draft = value; }, addAttachments(ids) { records.attachmentIds.push(...ids); return true; }, focus() { records.focused = true; }, notify(level, text) { records.notices.push({ level, text }); } };
     const conversation = { async send(prompt) { if (records.fail) throw new Error('测试：发送失败'); records.sent.push(prompt); }, input: { for: () => input },
@@ -47,18 +47,20 @@ async function fixture(mode = 'text', desktop = true, previewSource = source, as
       sidebarRight: { focusedTarget: () => ({ sessionId: 'qa', tabId: 'preview' }), isTargetCurrent: () => records.current },
       remote: { workspaceFiles: { async stat() { return { ok: true, value: { absolutePath: path, version: records.version, bytes: records.sourceText.length * 3 } }; },
         async readBytes(_sessionId,reference,options) { records.reads++;
+          if(options?.baseFile&&records.assetDelay){records.inflight++;records.maxInflight=Math.max(records.maxInflight,records.inflight);await new Promise(r=>setTimeout(r,records.assetDelay));records.inflight--;}
           if(options?.baseFile){records.assetReads.push(reference);if(!(reference in assets))throw new Error('Missing fixture asset: '+reference);const value=assets[reference];return {ok:true,value:{data:typeof value==='string'?new TextEncoder().encode(value):new Uint8Array(value),version:1,absolutePath:'C:/测试/'+reference}};}
-          return { ok: true, value: { data: mode==='image'?new Uint8Array([137,80,78,71,13,10,26,10,42]):new TextEncoder().encode(records.sourceText), version: records.version, absolutePath: path } }; } } },
+          return { ok: true, value: { data: mode==='image'?new Uint8Array(records.imageBytes??[137,80,78,71,13,10,26,10,42]):new TextEncoder().encode(records.sourceText), version: records.version, absolutePath: path } }; } } },
       connection: { rpc: { async call(channel, endpoint, payload, signal) {
         if (endpoint !== 'regionEdit/recognize') {
           if(channel!=='/api'||Object.keys(payload).length!==1||payload.args?.agentId!=='qa') throw new Error('Unexpected history RPC envelope');
           const request=payload.args.request, clone=value=>structuredClone(value);
-          if(endpoint==='regionEdit/listChanges') return {ok:true,value:clone(records.changes)};
+          if(endpoint==='regionEdit/listChanges') { records.listCalls=(records.listCalls??0)+1; return {ok:true,value:clone(records.changes)}; }
           if(endpoint==='regionEdit/prepareChange') {
-            if(records.historyFail) throw new Error('无法保存修改前的文件');
+            if(records.historyFail) throw new Error('原文件已更新，请重新选择。');
+            if(records.historySkip) return {ok:true,value:{skipped:records.historySkip}};
             const change={id:'change-'+(records.changes.length+1),path,created:Date.now(),instruction:request.instruction,state:'prepared',files:[],problems:[],texts:[],
               before:{source:records.sourceText,assets:Object.entries(assets).map(([reference,data])=>({reference,data:typeof data==='string'?new TextEncoder().encode(data):new Uint8Array(data)}))}};
-            records.changes.unshift(change); return {ok:true,value:clone(change)};
+            records.changes.unshift(change); return {ok:true,value:{change:clone(change)}};
           }
           const change=records.changes.find(c=>c.id===request.id);if(!change)throw new Error('记录已失效');
           if(endpoint==='regionEdit/changeDetail'){records.historyCalls.push('detail');const {before,after,texts,...summary}=change;return{ok:true,value:clone({...summary,snapshots:{before:true,after:!!after}})};}
@@ -110,7 +112,7 @@ async function fixture(mode = 'text', desktop = true, previewSource = source, as
               React.createElement('img', { id: 'image', src: imageUrl, alt: '图片预览：测试原图', style: { width: 320, height: 240, display: 'block' } }))
               : React.createElement('div', { className: 'text' }, React.createElement('h2', null, '我的工具'), React.createElement('p', { id: 'chosen' }, '这里是需要修改的说明文字。'), React.createElement('button', { id: 'start' }, '开始使用'), React.createElement('p', { id: 'other' }, '不要修改这一段文字。'))))));
     window.rerender();
-  }, { mode, source: previewSource, assets });
+  }, { mode, source: previewSource, assets, options });
   if (desktop) await page.locator('[data-region-edit]').waitFor();
 }
 async function pick(selector = '#chosen', frame = false, reverse = false) {
@@ -162,6 +164,7 @@ const pointSource = `<!doctype html>
 <button class="secondary">立即开始</button>
 <button class="primary"><span>立即开始</span></button>
 </section>
+<a class="more" href="https://example.com/plans">查看全部计划</a>
 </main>
 </body></html>`;
 const pointAssets = { 'styles/main.css': ':root{--brand:#315edd;--space:16px}body{margin:36px;font:16px system-ui}.actions{display:flex;gap:var(--space);margin-top:28px}button{font:inherit;padding:12px 20px;border:0;border-radius:10px}.primary{color:white;background-color:var(--brand)}.secondary{background:#e9edf4}@media(max-width:300px){.primary{color:red}}' };
@@ -334,6 +337,37 @@ try {
     assert.equal(data.target.label,'海报主标题'); assert.equal(data.target.source,'user'); assert.equal(data.target.text,'');
     assert.equal(await page.evaluate(()=>records.imageParts.length),1);
   });
+  await check('an optional contour marker drawn from the original reaches recognition and the request; it stays off by default', async () => {
+    await fixture('image'); await pickImage();
+    const box = page.getByLabel(/附带轮廓标记图/);
+    assert.equal(await box.isChecked(), false); assert.equal(await page.evaluate(()=>'marker' in records.recognitionRequests[0].request), false);
+    // A white original: inside the contour stays white, outside is dimmed, the outline is red.
+    await page.evaluate(async()=>{const c=new OffscreenCanvas(80,60),g=c.getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,80,60);
+      records.imageBytes=[...new Uint8Array(await (await c.convertToBlob({type:'image/png'})).arrayBuffer())];});
+    await box.check(); await page.getByText('点「重新识别」后用于识别').waitFor();
+    await page.getByRole('button',{name:'重新识别',exact:true}).click(); await page.waitForFunction(()=>records.recognitionRequests.length===2);
+    await page.getByText('点「重新识别」后用于识别').waitFor({state:'hidden'});
+    const pixels = await page.evaluate(async()=>{
+      const bytes=Uint8Array.from(atob(records.recognitionRequests[1].request.marker),c=>c.charCodeAt(0));
+      const bitmap=await createImageBitmap(new Blob([bytes],{type:'image/jpeg'})),c=new OffscreenCanvas(bitmap.width,bitmap.height),g=c.getContext('2d');g.drawImage(bitmap,0,0);
+      const at=(x,y)=>[...g.getImageData(x,y,1,1).data.slice(0,3)];
+      return {size:[bitmap.width,bitmap.height],jpeg:[...bytes.slice(0,3)],inside:at(400,300),outside:at(20,20),edge:at(600,300)};});
+    assert.deepEqual(pixels.size,[800,600]); assert.deepEqual(pixels.jpeg,[255,216,255]);
+    assert.ok(pixels.inside.every(v=>v>235),'inside stays white'); assert.ok(pixels.outside.every(v=>v>130&&v<175),'outside is dimmed');
+    assert.ok(pixels.edge[0]>200&&pixels.edge[1]<120,'outline is red');
+    await page.locator('textarea').fill('把标题改蓝'); await page.getByRole('button',{name:'发送修改',exact:true}).click();
+    await page.waitForFunction(()=>records.sent.length===1);
+    assert.deepEqual(await page.evaluate(()=>records.imageParts.map(p=>[p.name,p.type])),[['图片.png','image/png'],['选区标记.jpg','image/jpeg']]);
+    assert.match(await page.evaluate(()=>records.sent[0]),/第二个图片附件是插件用原图生成的缩小标记图/);
+  });
+  await check('an original that cannot be drawn falls back to recognition and sending without a marker', async () => {
+    await fixture('image'); await pickImage(); await page.getByLabel(/附带轮廓标记图/).check();
+    await page.getByRole('button',{name:'重新识别',exact:true}).click(); await page.waitForFunction(()=>records.recognitionRequests.length===2);
+    assert.equal(await page.evaluate(()=>'marker' in records.recognitionRequests[1].request), false);
+    await page.getByRole('button',{name:'重新识别',exact:true}).waitFor();
+    await page.locator('textarea').fill('修改'); await page.getByRole('button',{name:'发送修改',exact:true}).click(); await page.waitForFunction(()=>records.sent.length===1);
+    assert.equal(await page.evaluate(()=>records.imageParts.length),1); assert.doesNotMatch(await page.evaluate(()=>records.sent[0]),/标记图/);
+  });
   await check('a late recognition response cannot overwrite a manually entered target', async () => {
     await fixture('image'); await page.evaluate(()=>{records.recognitionDelay=600;records.recognitionIgnoresAbort=true;}); await pickImage();
     await page.getByRole('button',{name:'停止识别，手动指定',exact:true}).click();
@@ -365,6 +399,8 @@ try {
   await check('manual mode and target survive resizing and require confirmation before reuse', async () => {
     await fixture('image'); await page.evaluate(()=>{records.recognitionDelay=30000;}); await pickImage();
     await page.getByRole('button',{name:'停止识别，手动指定',exact:true}).click();
+    // Stopping moves focus to the target field on the next frame; typing elsewhere before that would land there.
+    await page.waitForFunction(()=>document.activeElement?.id==='re-target');
     await page.getByLabel('圈中的目标',{exact:true}).fill('右上方的校徽'); await page.locator('textarea').fill('缩小一点');
     try {
       await page.setViewportSize({width:1200,height:820}); await page.locator('.re-instruction').waitFor(); await pickImage();
@@ -431,10 +467,42 @@ try {
     assert.equal(target.context.classes, 'primary'); assert.equal(target.context.variables['--brand'], '#315edd');
     assert.equal(target.context.styles['background-color'], 'rgb(49, 94, 221)');
     assert.equal(target.context.parent.styles.display, 'flex'); assert.equal(target.context.parent.styles.gap, '16px');
+    // Only layout facts for the parent, no initial values, and no picker geometry or markup the source tag replaces.
+    assert.ok(Object.keys(target.context.parent.styles).every(k => !/color|font|border|line-height|margin/.test(k)));
+    assert.ok(!Object.values(target.context.styles).some(v => v === 'none' || v === 'normal' || v === '0px'));
+    for (const key of ['box', 'viewport', 'element']) assert.equal(key in e.selection, false, key);
+    assert.equal('html' in target, false); assert.equal('truncated' in e.selection, false);
+    console.log(`point request evidence: ${JSON.stringify(e).length} characters`);
     assert.ok(target.context.rules.some(r => r.file === 'styles/main.css' && r.selector === '.primary'));
     assert.ok(!target.context.rules.some(r => r.declarations.includes('color: red')));
     assert.equal(await page.evaluate(() => records.recognitionRequests.length), 0);
     assert.equal(await page.evaluate(() => records.imageParts.length), 0);
+  });
+  await check('nested, layered, container and scoped rules are found, written as in the source and marked with their condition', async () => {
+    const modern = [
+      '.actions { gap: 20px; & .primary { letter-spacing: 1px; } & > .secondary { word-spacing: 9px; } .primary:hover { opacity: .5; } }',
+      '.primary { &:not(.secondary) { outline-offset: 3px; } text-indent: 2px; }',
+      '@media (min-width: 1px) { .pricing { .primary { tab-size: 4; } } }',
+      '@layer base { .primary { word-spacing: 1px; } }',
+      '@container (min-width: 1px) { .primary { column-gap: 5px; } }',
+      '@scope (.actions) to (span) { :scope > .primary { --scoped: 1; } p { --wrong: 1; } }'].join('\n');
+    const source = pointSource.replace('<link rel="stylesheet" href="styles/main.css">', '<link rel="stylesheet" href="styles/main.css"><link rel="stylesheet" href="styles/modern.css">');
+    await fixture('html', true, source, { ...pointAssets, 'styles/modern.css': modern }); await point('.primary');
+    await page.mouse.move(5, 5);
+    await page.locator('textarea').fill('沿用现有样式'); await page.getByRole('button', { name: '发送修改', exact: true }).click();
+    await page.waitForFunction(() => records.sent.length === 1);
+    const rules = (await sentEvidence()).selection.elements[0].context.rules.filter(r => r.file === 'styles/modern.css');
+    assert.deepEqual(rules.map(r => [r.selector, r.declarations, r.condition]), [
+      ['.actions { & .primary }', 'letter-spacing: 1px;', undefined],
+      ['.actions { & .primary:hover }', 'opacity: 0.5;', '交互状态 :hover'],
+      ['.primary { &:not(.secondary) }', 'outline-offset: 3px;', undefined],
+      ['.primary', 'text-indent: 2px;', undefined],
+      // CSSOM serializes an implicit nesting selector with its `&`.
+      ['.pricing { & .primary }', 'tab-size: 4;', undefined],
+      ['.primary', 'word-spacing: 1px;', '@layer base'],
+      ['.primary', 'column-gap: 5px;', '@container (min-width: 1px)'],
+      ['@scope (.actions) to (span) { :scope > .primary }', '--scoped: 1;', '@scope (.actions) to (span)']]);
+    assert.match(await page.evaluate(() => records.sent[0]), /rules\[\]\.condition/);
   });
   await check('author rules after a large framework stylesheet are reported in cascade order', async () => {
     const framework = 'button{border:0}\n' + Array.from({ length: 3000 }, (_, i) => `.fw-${i}{margin:${i % 7}px}`).join('\n');
@@ -453,11 +521,62 @@ try {
     await page.getByRole('button', { name: '选择外层', exact: true }).click();
     await page.getByText('定位信息 · 第 6 行', { exact: true }).waitFor();
     assert.equal(await page.locator('textarea').inputValue(), '调整两颗按钮之间的间距');
-    await page.getByRole('button', { name: '返回内层', exact: true }).click();
+    await page.getByRole('button', { name: '选择内层', exact: true }).click();
     await page.getByText('定位信息 · 第 8 行', { exact: true }).waitFor();
     await page.getByRole('button', { name: '放入输入框', exact: true }).click();
     await page.waitForFunction(() => records.draft.text.includes('调整两颗按钮'));
     assert.match(await page.evaluate(() => records.draft.text), /"classes":"primary"/);
+  });
+  await check('the preview keeps links without leaving the page and shows srcset and picture images', async () => {
+    const png = [...Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64')];
+    const body = '<style>a:link{color:rgb(1, 2, 3)}a[href^="https"]{text-decoration-color:rgb(4, 5, 6)}p{margin-top:1200px}</style>'
+      + '<a id="out" href="https://example.com/">外部链接</a> <a id="jump" href="#target">跳到下方</a>'
+      + '<img id="set" alt="srcset" srcset="img/b.png 2x, img/a.png 1x"><picture><source srcset="img/b.png" type="image/png"><img id="pic" alt="picture" src="img/a.png"></picture><p id="target">目标</p>';
+    await fixture('html', true, '<!doctype html><html><body>' + body + '</body></html>', { 'img/a.png': png, 'img/b.png': png });
+    const frame = page.frameLocator('[data-region-frame]');
+    await frame.locator('#pic').evaluate(n => n.complete ? undefined : new Promise(r => n.addEventListener('load', r, { once: true })));
+    assert.deepEqual(await frame.locator('#out').evaluate(n => [n.getAttribute('href'), getComputedStyle(n).color, getComputedStyle(n).textDecorationColor]), ['https://example.com/', 'rgb(1, 2, 3)', 'rgb(4, 5, 6)']);
+    assert.deepEqual(await frame.locator('img').evaluateAll(nodes => nodes.map(n => [n.id, n.naturalWidth])), [['set', 1], ['pic', 1]]);
+    assert.equal(await frame.locator('picture source').count(), 0);
+    assert.deepEqual(await page.evaluate(() => [...new Set(records.assetReads)]), ['img/a.png']);
+    await frame.locator('#out').click(); await page.waitForTimeout(300);
+    assert.equal(await frame.locator('#out').count(), 1);
+    await frame.locator('#jump').click(); await page.waitForTimeout(100);
+    assert.deepEqual(await frame.locator('html').evaluate(() => [scrollY > 500, location.href]), [true, 'about:srcdoc']);
+  });
+  await check('linked files load concurrently, including what nested stylesheets import, with cyclic imports intact', async () => {
+    const png = [...Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64')];
+    const html = '<!doctype html><link rel="stylesheet" href="a.css"><link rel="stylesheet" href="b.css"><style>@import "c.css";</style>'
+      + '<img src="1.png" alt="1"><img src="2.png" alt="2"><img src="3.png" alt="3"><p id="t">文字</p>';
+    const assets = { 'a.css': '@import "b.css"; #t{color:rgb(10, 0, 0)}', 'b.css': '@import "a.css"; @import "d.css"; #t{background:url(4.png)}',
+      'c.css': '@import "a.css"; #t{border-left:1px solid rgb(0, 0, 30)}', 'd.css': '#t{padding-left:7px}', '1.png': png, '2.png': png, '3.png': png, '4.png': png };
+    const started = Date.now();
+    await fixture('html', true, html, assets, { assetDelay: 150 });
+    await page.locator('[data-region-connected]').waitFor({ timeout: 8000 });
+    const elapsed = Date.now() - started, frame = page.frameLocator('[data-region-frame]');
+    console.log(`8 linked files at 150 ms each: preview ready in ${elapsed} ms, ${await page.evaluate(() => records.maxInflight)} reads at once`);
+    assert.deepEqual(await frame.locator('#t').evaluate(n => { const s = getComputedStyle(n); return [s.color, s.paddingLeft, s.borderLeftColor, s.backgroundImage.startsWith('url("data:image/png')]; }),
+      ['rgb(10, 0, 0)', '7px', 'rgb(0, 0, 30)', true]);
+    assert.deepEqual(await page.evaluate(() => [...records.assetReads].sort()), ['1.png', '2.png', '3.png', '4.png', 'a.css', 'b.css', 'c.css', 'd.css']);
+    // Eight 150 ms reads one after another take 1.2 s; here only the import depth (a or b, then d, then 4.png) is sequential.
+    assert.ok(await page.evaluate(() => records.maxInflight) >= 4, 'reads overlap');
+    assert.ok(elapsed < 1200, `loaded in ${elapsed} ms`);
+  });
+  await check('a click inside a button starts at the button and inner levels reach the clicked part', async () => {
+    await fixture('html', true, pointSource, pointAssets); await point('.primary span');
+    const inner = page.getByRole('button', { name: '选择内层', exact: true }), outer = page.getByRole('button', { name: '选择外层', exact: true });
+    assert.match(await page.locator('.re-location summary').textContent(), /第 8 行/);
+    await page.locator('.re-location summary').click(); await page.locator('.re-location code').first().filter({ hasText: /button/ }).waitFor();
+    assert.equal(await inner.isDisabled(), false); await inner.click();
+    await page.locator('.re-location code').first().filter({ hasText: /> span$/ }).waitFor();
+    assert.equal(await inner.isDisabled(), true);
+    await outer.click(); await outer.click();
+    await page.getByText('定位信息 · 第 6 行', { exact: true }).waitFor();
+    await inner.click(); await page.locator('.re-location code').first().filter({ hasText: /button/ }).waitFor();
+    await inner.click(); await page.locator('.re-location code').first().filter({ hasText: /> span$/ }).waitFor();
+    await page.locator('textarea').fill('只改按钮里的文字'); await page.getByRole('button', { name: '发送修改', exact: true }).click();
+    await page.waitForFunction(() => records.sent.length === 1);
+    assert.equal((await sentEvidence()).selection.elements[0].tag, 'span');
   });
   await check('replacing a selected DOM node cannot redirect a request to an identical clone', async () => {
     await fixture('html', true, pointSource, pointAssets); await point('.primary');
@@ -525,11 +644,36 @@ try {
     await page.getByText(/还没有修改记录/).waitFor();assert.equal(await page.evaluate(()=>records.sent.length),0);
     await page.keyboard.press('Escape');await page.getByRole('dialog').waitFor({state:'hidden'});
   });
-  await check('failed baseline capture prevents delivery and keeps the user instruction', async () => {
+  await check('the record list polls by state and pauses while the window is hidden', async () => {
+    await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('先放入输入框');
+    await page.getByRole('button',{name:'放入输入框',exact:true}).click();await page.waitForFunction(()=>records.changes.length===1);
+    const visibility=hidden=>page.evaluate(hidden=>{Object.defineProperty(document,'hidden',{configurable:true,get:()=>hidden});document.dispatchEvent(new Event('visibilitychange'));},hidden);
+    await page.waitForTimeout(300);await page.evaluate(()=>{records.listCalls=0;});
+    await page.waitForTimeout(2500);assert.equal(await page.evaluate(()=>records.listCalls),0,'an unsent request is not polled every 2 s');
+    await page.evaluate(()=>{records.changes[0].state='running';});
+    await visibility(true);await visibility(false);await page.waitForFunction(()=>records.listCalls===1);
+    await page.waitForFunction(()=>records.listCalls>=2,null,{timeout:3000});
+    await visibility(true);const paused=await page.evaluate(()=>records.listCalls);
+    await page.waitForTimeout(2500);assert.equal(await page.evaluate(()=>records.listCalls),paused);
+    await page.evaluate(()=>{delete document.hidden;});
+  });
+  await check('a stale baseline prevents delivery and keeps the user instruction', async () => {
     await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('保留我的要求');
     await page.evaluate(()=>records.historyFail=true);await page.getByRole('button',{name:'发送修改',exact:true}).click();
-    await page.getByRole('alert').filter({hasText:'无法保存修改前的文件'}).waitFor();
+    await page.getByRole('alert').filter({hasText:'原文件已更新'}).waitFor();
     assert.equal(await page.evaluate(()=>records.sent.length),0);assert.equal(await page.locator('textarea').inputValue(),'保留我的要求');
+  });
+  await check('a request that cannot be recorded is still sent or staged, without a marker and with a notice', async () => {
+    for (const draft of [false, true]) {
+      await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('会话运行中也要能发');
+      await page.evaluate(()=>records.historySkip='当前会话正在运行。');
+      await page.getByRole('button',{name:draft?'放入输入框':'发送修改',exact:true}).click();
+      await page.locator('.re-panel').waitFor({state:'hidden'});
+      const result=await page.evaluate(()=>({sent:records.sent,draft:records.draft.text,notices:records.notices,changes:records.changes.length}));
+      const text=draft?result.draft:result.sent[0];
+      assert.ok(text.includes('会话运行中也要能发'));assert.ok(!text.includes('[dsh-region-edit:'));assert.equal(result.changes,0);
+      assert.ok(result.notices.some(n=>n.text.includes('不能一键回滚：当前会话正在运行。')));
+    }
   });
   await check('failed delivery removes its unused baseline so retry can create a fresh record', async () => {
     await fixture('html',true,pointSource,pointAssets);await point('.primary');await page.locator('textarea').fill('重试修改');
@@ -554,6 +698,7 @@ try {
     assert.equal(await page.frameLocator('iframe[title="修改前"]').locator('.primary').evaluate(n=>getComputedStyle(n).padding),'12px 20px');
     assert.equal(await page.frameLocator('iframe[title="修改后"]').locator('.primary').evaluate(n=>getComputedStyle(n).padding),'20px 32px');
     assert.equal(await page.locator('iframe[title="修改前"]').getAttribute('sandbox'),'');
+    assert.deepEqual(await page.frameLocator('iframe[title="修改后"]').locator('a.more').evaluate(n=>[n.getAttribute('href'),getComputedStyle(n).pointerEvents]),['https://example.com/plans','none']);
     await page.locator('.re-history-files summary').click();await page.getByText('C:/测试/styles/main.css · 可恢复',{exact:true}).waitFor();
     await page.screenshot({path:'artifacts/comparison-v0.5.0.png'});
     await page.getByRole('button',{name:'文件内容',exact:true}).click();await page.getByLabel('对比文件').selectOption('1');

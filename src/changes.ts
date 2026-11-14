@@ -13,6 +13,11 @@ export interface ChangeText { path: string; before?: string; after?: string }
 /** Status plus which frozen sides exist. Contents are fetched separately and are immutable once present. */
 export interface ChangeDetail extends ChangeSummary { snapshots: { before: boolean; after: boolean } }
 export type ChangePart = 'before' | 'after' | 'texts';
+/**
+ * prepareChange opens a record, or says why this request goes out without one. Only a stale selection is an error:
+ * a missing record never blocks delivery.
+ */
+export type PrepareResult = { change: ChangeSummary } | { skipped: string };
 export interface ChangeApi {
   list(signal: AbortSignal): Promise<ChangeSummary[]>;
   detail(id: string, signal: AbortSignal): Promise<ChangeDetail>;

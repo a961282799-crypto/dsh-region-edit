@@ -4,15 +4,17 @@ const { createRequire } = require('node:module');
 async function main() {
   const hostRequire = createRequire(process.env.DSH_HOST_PACKAGE || 'D:/deepseek harness/resources/app.asar/dsh/package.json');
   const manifest = require('../package.json');
-  assert.equal(hostRequire('./package.json').version, manifest.peerDependencies['@deepseek-ai/dsh'], 'Installed host must match the declared compatibility version');
-  for (const [name, version] of Object.entries(manifest.peerDependencies)) {
-    assert.equal(hostRequire(name + '/package.json').version, version, `Installed ${name} must match the declared version`);
+  const { satisfies } = hostRequire('semver');
+  const hostVersion = hostRequire('./package.json').version;
+  for (const [name, range] of Object.entries(manifest.peerDependencies)) {
+    const installed = hostRequire(name + '/package.json').version;
+    assert.ok(satisfies(installed, range, { includePrerelease: true }), `Installed ${name}@${installed} must satisfy ${range}`);
   }
   const { evaluatePluginCompatibility } = hostRequire('@deepseek-ai/dsh-app-boot');
   assert.equal(evaluatePluginCompatibility(manifest), undefined, 'Host compatibility gate must accept the plugin without exemptions');
   for (const name of manifest.dsh.client.inject) {
     const dependency = hostRequire(name + '/package.json');
-    assert.equal(dependency.version, manifest.peerDependencies['@deepseek-ai/dsh'], `Client dependency ${name} must match the installed host`);
+    assert.equal(dependency.version, hostVersion, `Client dependency ${name} must match the installed host`);
   }
   console.log('PASS installed host compatibility gate, peer versions and client dependencies');
   const { Context } = hostRequire('@deepseek-ai/cordis');
@@ -70,7 +72,7 @@ async function main() {
       await io.writeFile(main,original);await io.writeFile(css,'button{padding:12px}');
       const editing={session:{id:'history-qa',header:{cwd:scratch},requestHeader:agent.session.requestHeader}},signal=new AbortController().signal;
       const target=await nativeFs.resolve(main,{cwd:scratch,signal}), stat=await nativeFs.stat(target,signal);
-      const record=await service.prepareChange(editing,{path:main,version:JSON.stringify(stat.version),instruction:'增大按钮'},signal);
+      const record=(await service.prepareChange(editing,{path:main,version:JSON.stringify(stat.version),instruction:'增大按钮'},signal)).change;assert.ok(record);
       assert.equal((await service.listChanges(editing,signal)).length,1);
       await ctx.parallel('session/event',editing.session,{type:'turn/start',seq:1,data:{turn:1}});
       await ctx.parallel('session/event',editing.session,{type:'user/message',seq:2,data:{source:{kind:'user'},content:[{type:'text',text:`[dsh-region-edit:${record.id}]`}]}});
@@ -85,7 +87,7 @@ async function main() {
       assert.equal((await service.restoreChange(editing,{id:record.id},signal)).state,'restored');
       assert.deepEqual(await io.readFile(main),Buffer.from(original));assert.equal(await io.readFile(css,'utf8'),'button{padding:12px}');
       // The real backend must refuse a stale version even when called through the plugin.
-      const next=await service.prepareChange(editing,{path:main,version:JSON.stringify((await nativeFs.stat(target,signal)).version),instruction:'再修改'},signal);
+      const next=(await service.prepareChange(editing,{path:main,version:JSON.stringify((await nativeFs.stat(target,signal)).version),instruction:'再修改'},signal)).change;assert.ok(next);
       await ctx.parallel('session/event',editing.session,{type:'turn/start',seq:4,data:{turn:2}});
       await ctx.parallel('session/event',editing.session,{type:'user/message',seq:5,data:{content:[{type:'text',text:`[dsh-region-edit:${next.id}]`}]}});
       await ctx.serial('tools/pre-execute',{agent:editing,signal},()=>Promise.resolve());

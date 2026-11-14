@@ -1,10 +1,12 @@
 import { collectRegion, elementSnapshot, selectorOf } from './selection.ts';
 import type { Region, SelectedElement } from './selection.ts';
+import { resolveSelector } from './css-selector.ts';
 
 export const STYLE_KEYS = ['display', 'position', 'box-sizing', 'width', 'height', 'max-width', 'color', 'background-color',
   'font-family', 'font-size', 'font-weight', 'line-height', 'padding', 'margin', 'border', 'border-radius',
   'gap', 'flex-direction', 'align-items', 'justify-content', 'grid-template-columns'] as const;
-export interface StyleRule { selector: string; declarations: string; file?: string }
+/** `condition`: the @container, @scope or @layer the rule sits in, or the interaction state it needs; reported, not evaluated. */
+export interface StyleRule { selector: string; declarations: string; file?: string; condition?: string }
 export interface ElementContext {
   classes: string; inlineStyle: string; styles: Record<string, string>; variables: Record<string, string>; rules: StyleRule[];
   parent?: { tag: string; selector: string; classes: string; styles: Record<string, string> };
@@ -29,39 +31,75 @@ function stylesOf(node: Element): Record<string, string> {
   return Object.fromEntries(STYLE_KEYS.map(key => [key, compact(style.getPropertyValue(key))]));
 }
 const RULE_RESULTS = 8, RULE_SCAN = 20000;
+const INTERACTION = /:(?:hover|active|focus-visible|focus-within|focus)(?![\w-])/g;
 /** Cheap pre-check before Element.matches: only false positives are allowed, never a missed rule. */
 function candidateTest(node: Element): (selector: string) => boolean {
   const tokens = [node.localName, ...(node.id ? [`#${CSS.escape(node.id)}`] : []), ...[...node.classList].map(name => `.${CSS.escape(name)}`)].map(t => t.toLowerCase());
   return selector => { const text = selector.toLowerCase(); return /[*[:]/.test(text) || tokens.some(token => text.includes(token)); };
 }
+interface RuleContext {
+  file?: string;
+  /** Absolute selector of the enclosing style rule or scope start, and how the source writes the chain. */
+  parent?: string; written?: string; scope?: boolean;
+  /** A prelude-less @scope: rules apply inside this element. */
+  root?: Element;
+  conditions: string[];
+}
 /**
  * The last matching rules in cascade order. Sheets and rules are walked from the end, so author styles loaded
- * after a large framework (Bootstrap, Tailwind) are reached first, and the walk stops after 8 matches.
+ * after a large framework (Bootstrap, Tailwind) are reached first, and the walk stops after 8 matches. Nested rules
+ * come after their parent's own declarations, so they are visited first.
  */
 function rulesOf(node: Element): StyleRule[] {
   const found: StyleRule[] = [];
   const view = node.ownerDocument.defaultView!, candidate = candidateTest(node);
   let visited = 0;
   const done = () => found.length >= RULE_RESULTS || visited > RULE_SCAN;
-  const walk = (rules: CSSRuleList, file?: string) => {
+  const record = (selector: string, written: string, declarations: string, at: RuleContext) => {
+    if (!declarations.trim() || !candidate(selector) || at.root && !at.root.contains(node)) return;
+    // Whether the pointer happens to rest on the element must not decide what is reported: interaction states
+    // count as possible, and the rule says which state it needs.
+    const states = [...new Set(selector.match(INTERACTION) ?? [])];
+    const conditions = states.length ? [...at.conditions, `交互状态 ${states.join(' ')}`] : at.conditions;
+    try {
+      if (node.matches(states.length ? selector.replace(INTERACTION, ':where(*)') : selector)) found.push({ selector: written.slice(0, 300), declarations: compact(declarations, 700),
+        ...(at.file ? { file: at.file } : {}), ...(conditions.length ? { condition: conditions.join(' ').slice(0, 300) } : {}) });
+    } catch { /* Unsupported selectors are not evidence of a match. */ }
+  };
+  const walk = (rules: CSSRuleList, at: RuleContext) => {
     for (let index = rules.length - 1; index >= 0 && !done(); index--) {
-      const rule = rules[index]!; visited++;
+      const rule = rules[index]!, kind = rule.constructor.name; visited++;
       if (rule instanceof view.CSSStyleRule) {
-        if (!candidate(rule.selectorText)) continue;
-        try {
-          if (node.matches(rule.selectorText)) found.push({ selector: rule.selectorText.slice(0, 300), declarations: compact(rule.style.cssText, 700), ...(file ? { file } : {}) });
-        } catch { /* Unsupported selectors are not evidence of a match. */ }
+        const written = at.written ? `${at.written} { ${rule.selectorText} }` : rule.selectorText;
+        const absolute = at.parent ? resolveSelector(rule.selectorText, at.parent, at.scope) : at.root && rule.selectorText.includes(':scope') ? '' : rule.selectorText;
+        if (!absolute) continue;
+        if (rule.cssRules?.length) walk(rule.cssRules, { ...at, parent: absolute, written, scope: false });
+        if (!done()) record(absolute, written, rule.style.cssText, at);
+      } else if (kind === 'CSSNestedDeclarations' && at.parent) {
+        // Declarations written after nested rules belong to the enclosing selector.
+        record(at.parent, at.written ?? at.parent, (rule as CSSRule & { style: CSSStyleDeclaration }).style.cssText, at);
       } else if (rule instanceof view.CSSMediaRule) {
-        if (view.matchMedia(rule.conditionText).matches) walk(rule.cssRules, file);
+        if (view.matchMedia(rule.conditionText).matches) walk(rule.cssRules, at);
       } else if (rule instanceof view.CSSSupportsRule) {
-        if (view.CSS.supports(rule.conditionText)) walk(rule.cssRules, file);
+        if (view.CSS.supports(rule.conditionText)) walk(rule.cssRules, at);
       } else if (rule instanceof view.CSSImportRule) {
         // Imported data URLs do not preserve a trustworthy source filename.
         if (rule.styleSheet && (!rule.media.mediaText || view.matchMedia(rule.media.mediaText).matches)) {
-          try { walk(rule.styleSheet.cssRules); } catch { /* Unreadable sheet. */ }
+          try { walk(rule.styleSheet.cssRules, { conditions: at.conditions }); } catch { /* Unreadable sheet. */ }
         }
-      } else if (rule.constructor.name === 'CSSLayerBlockRule' && 'cssRules' in rule) {
-        walk((rule as CSSGroupingRule).cssRules, file);
+      } else if (kind === 'CSSContainerRule') {
+        // Whether a container query holds depends on an ancestor's size; it is reported, not decided here.
+        walk((rule as CSSGroupingRule).cssRules, { ...at, conditions: [...at.conditions, `@container ${(rule as CSSConditionRule).conditionText}`] });
+      } else if (kind === 'CSSLayerBlockRule') {
+        const name = (rule as CSSRule & { name: string }).name;
+        walk((rule as CSSGroupingRule).cssRules, { ...at, conditions: [...at.conditions, name ? `@layer ${name}` : '@layer'] });
+      } else if (kind === 'CSSScopeRule') {
+        const scope = rule as CSSGroupingRule & { start: string | null; end: string | null };
+        const condition = `@scope${scope.start ? ` (${scope.start})` : ''}${scope.end ? ` to (${scope.end})` : ''}`;
+        const owner = rule.parentStyleSheet?.ownerNode;
+        const inner: RuleContext = { ...at, conditions: [...at.conditions, condition] };
+        if (scope.start) walk(scope.cssRules, { ...inner, parent: at.parent ? resolveSelector(scope.start, at.parent) : scope.start, written: condition, scope: true });
+        else if (owner instanceof view.Element && owner.parentElement) walk(scope.cssRules, { ...inner, root: owner.parentElement, written: condition });
       }
     }
   };
@@ -71,7 +109,7 @@ function rulesOf(node: Element): StyleRule[] {
     if (sheet.disabled || sheet.media.mediaText && !view.matchMedia(sheet.media.mediaText).matches) continue;
     const owner = sheet.ownerNode;
     const file = owner instanceof view.Element ? owner.getAttribute('data-region-stylesheet') ?? undefined : undefined;
-    try { walk(sheet.cssRules, file); } catch { /* CSSOM access is optional. */ }
+    try { walk(sheet.cssRules, { ...(file ? { file } : {}), conditions: [] }); } catch { /* CSSOM access is optional. */ }
   }
   return found.reverse();
 }
@@ -105,6 +143,8 @@ export function enrichRegion(region: Region, root: Element): Region {
 export class ElementReader {
   private ids = new WeakMap<Element, string>();
   private nodes = new Map<string, WeakRef<Element>>();
+  /** The node actually under the pointer at the last click; inner levels lead back toward it. */
+  private deepest: WeakRef<Element> | undefined;
   constructor(private doc: Document) {}
   private id(node: Element): string {
     let id = this.ids.get(node);
@@ -115,10 +155,20 @@ export class ElementReader {
     return id;
   }
   at(x: number, y: number, hover = false): Region {
-    let node = this.doc.elementFromPoint(x, y);
-    if (!node || node === this.doc.documentElement) throw new Error('这里没有可选择的页面元素。');
-    node = node.closest('button,a,[role="button"],label,svg') ?? node;
+    const hit = this.doc.elementFromPoint(x, y);
+    if (!hit || hit === this.doc.documentElement) throw new Error('这里没有可选择的页面元素。');
+    // Start at the control a click usually means; the parts inside stay reachable as inner levels.
+    const node = hit.closest('button,a,[role="button"],label,svg') ?? hit;
+    if (!hover) this.deepest = new WeakRef(hit);
     return this.readNode(node, hover);
+  }
+  /** The next visible element inside `node` on the path to the clicked node, if the click was inside it. */
+  private inner(node: Element): Element | undefined {
+    const deepest = this.deepest?.deref();
+    if (!deepest?.isConnected || deepest === node || !node.contains(deepest)) return;
+    const path: Element[] = [];
+    for (let current: Element | null = deepest; current && current !== node; current = current.parentElement) path.unshift(current);
+    return path.find(child => { const rect = child.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; });
   }
   read(id: string): Region {
     const node = this.nodes.get(id)?.deref();
@@ -137,6 +187,10 @@ export class ElementReader {
     // Hover only draws a box; handles are issued on click so browsing a large page cannot exhaust them.
     return { box, viewport: { width: view.innerWidth, height: view.innerHeight, scrollX: view.scrollX, scrollY: view.scrollY },
       text: text.slice(0, 6000), elements: [hover ? element : enrich(element, node)], truncated: !!collected?.truncated || text.length > 6000,
-      ...(hover ? {} : { element: { id: this.id(node), ...(parent && parent !== this.doc.documentElement ? { parentId: this.id(parent) } : {}) } }) };
+      ...(hover ? {} : { element: this.handles(node, parent) }) };
+  }
+  private handles(node: Element, parent: Element | null): NonNullable<Region['element']> {
+    const child = this.inner(node);
+    return { id: this.id(node), ...(parent && parent !== this.doc.documentElement ? { parentId: this.id(parent) } : {}), ...(child ? { childId: this.id(child) } : {}) };
   }
 }

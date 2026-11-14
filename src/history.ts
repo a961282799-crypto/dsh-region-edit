@@ -1,9 +1,10 @@
+import { Buffer } from 'node:buffer';
 import { parse } from 'parse5';
 import type { DefaultTreeAdapterMap } from 'parse5';
 import { rewriteCssAssets } from './css-assets.ts';
-import { PREVIEW_LIMITS, cssResource, imageSourceMime, isStylesheetLink, resolveReference } from './resources.ts';
+import { PREVIEW_LIMITS, cssResource, imageReference, isStylesheetLink, resolveReference } from './resources.ts';
 import { changeMarker } from './changes.ts';
-import type { ChangeSummary, ChangeDetail, ChangeText, ChangePart, PreviewSnapshot } from './changes.ts';
+import type { ChangeSummary, ChangeDetail, ChangeText, ChangePart, PrepareResult, PreviewSnapshot } from './changes.ts';
 import type { HistoryStore } from './history-store.ts';
 
 export interface FsTarget { targetKey: string; displayPath: string }
@@ -34,10 +35,14 @@ interface RecordEntry {
   reloaded?: boolean; saving?: Promise<void>;
 }
 const MAX_FILE = 4 * 1024 * 1024, MAX_BYTES = 16 * 1024 * 1024, MAX_FILES = 33;
-const MAX_RECORDS = 8, BUDGET = 64 * 1024 * 1024, KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+/** Per session, so one busy conversation cannot use up another's history; the global caps bound memory and disk. */
+export const RECORD_LIMITS = { session: 10, total: 40, bytes: 64 * 1024 * 1024 } as const;
 const FINISHED: readonly ChangeSummary['state'][] = ['ready', 'restored', 'failed'];
+/** The selection no longer matches the files: the request itself must be redone, unlike a record that cannot be kept. */
+class StaleError extends Error {}
 const decode = (data: Uint8Array) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
-const same = (a?: Uint8Array, b?: Uint8Array) => a === b || !!a && !!b && a.length === b.length && a.every((value, i) => value === b[i]);
+/** Exact byte equality; files reach 4 MiB and are compared before tools run, so this uses the native comparison. */
+const same = (a?: Uint8Array, b?: Uint8Array) => a === b || !!a && !!b && a.length === b.length && Buffer.compare(a, b) === 0;
 const textOf = (file: FileCopy) => { if (!file.data || file.data.includes(0)) throw new Error('不是可恢复的 UTF-8 文本'); return decode(file.data); };
 const directory = (path: string) => path.replaceAll('\\', '/').replace(/\/[^/]*$/, '/');
 const messageText = (data: unknown): string => {
@@ -158,7 +163,7 @@ export class EditHistory {
     if (!info) return { target, path: absolute };
     if (info.type !== 'file' || info.size > MAX_FILE) throw new Error('不是普通文件或超过 4 MiB');
     const data = new Uint8Array(await this.host.fs.readBytes(target, signal, MAX_FILE));
-    if ((await this.host.fs.stat(target, signal))?.version !== info.version) throw new Error('读取时文件发生变化');
+    if ((await this.host.fs.stat(target, signal))?.version !== info.version) throw new StaleError('读取时文件发生变化');
     return { target, path: absolute, data, version: info.version };
   }
   private retain(record: RecordEntry, copy: FileCopy) {
@@ -168,7 +173,7 @@ export class EditHistory {
   }
   /** Discover the same local styles, imports, fonts and images that the static preview renders (rules in resources.ts). */
   private async snapshot(record: RecordEntry, rootFile: FileCopy, read: (path: string) => Promise<FileCopy>): Promise<PreviewSnapshot> {
-    if (!rootFile.data) throw new Error('HTML 文件已删除');
+    if (!rootFile.data) throw new StaleError('HTML 文件已删除');
     if (rootFile.data.length > 1024 * 1024) throw new Error('HTML 超过 1 MiB');
     const source = decode(rootFile.data), assets: PreviewSnapshot['assets'] = [], visited = new Set<string>();
     const load = async (raw: string, base: string, stylesheet: boolean): Promise<void> => {
@@ -195,52 +200,69 @@ export class EditHistory {
       if (!('tagName' in node)) continue;
       const attr = (name: string) => node.attrs.find(a => a.name === name)?.value ?? '';
       if (node.tagName === 'link' && isStylesheetLink(attr('rel'), attr('href'))) await load(attr('href'), '', true);
-      if (node.tagName === 'img' && imageSourceMime(attr('src'))) await load(attr('src'), '', false);
+      if (node.tagName === 'img') { const image = imageReference(attr('src'), attr('srcset')); if (image) await load(image, '', false); }
       if (attr('style')) await css(attr('style'));
       if (node.tagName === 'style') await css(node.childNodes.filter(n => 'value' in n).map(n => (n as { value: string }).value).join(''));
     }
     return { source, assets };
   }
-  async prepare(session: HistorySession, request: { path: string; version: string; instruction: string }, signal: AbortSignal) {
+  /**
+   * Capture the baseline for a new request. A request that cannot be recorded (a turn is running, the history is
+   * full, a file is out of bounds) still goes out, without rollback; only a stale selection rejects.
+   */
+  async prepare(session: HistorySession, request: { path: string; version: string; instruction: string }, signal: AbortSignal): Promise<PrepareResult> {
     if (!session.header.cwd || !request || typeof request.path !== 'string' || request.path.length > 4096 || !/\.html?$/i.test(request.path)
       || typeof request.version !== 'string' || typeof request.instruction !== 'string' || request.instruction.length > 6000) throw new Error('修改记录参数无效。');
     const boundary = this.host.sessionProjections.stateOf(session, 'turnBoundary') as { openTurnStartSeq?: number | null } | undefined;
-    if (this.turns.has(session.id) || boundary?.openTurnStartSeq != null) throw new Error('请等当前会话这一轮结束，再发起带回滚记录的修改。');
-    if (this.preparing.has(session.id) || [...this.records.values()].some(r => r.session.id === session.id && ['running', 'finishing'].includes(r.summary.state))) throw new Error('当前会话已有正在进行的修改，请等本轮结束后再发起。');
+    // While a turn runs, a queued message could be attributed to that turn, so its baseline would not be its own.
+    if (this.turns.has(session.id) || boundary?.openTurnStartSeq != null) return { skipped: '当前会话正在运行。' };
+    if (this.preparing.has(session.id) || [...this.records.values()].some(r => r.session.id === session.id && ['running', 'finishing'].includes(r.summary.state))) {
+      return { skipped: '当前会话已有进行中的修改记录。' };
+    }
     // An unsent request has changed nothing, so a new request replaces it once the new baseline exists.
     const unsent = [...this.records.values()].filter(r => r.session.id === session.id && r.summary.state === 'prepared');
-    const evicted = this.evictions(unsent);
+    const evicted = this.evictions(session, unsent);
+    if (!evicted) return { skipped: '修改记录已满，且没有可以自动清理的已结束记录。' };
     this.preparing.add(session.id);
+    const requested = signal;
     try {
-    signal = this.signal(signal);
-    const root = await this.host.fs.resolve(session.header.cwd, { signal });
-    const record: RecordEntry = { summary: { id: crypto.randomUUID(), path: request.path, instruction: request.instruction, created: Date.now(), state: 'prepared', files: [], problems: [] },
-      session, root, pairs: new Map(), before: { source: '', assets: [] }, checked: false, busy: false, bytes: 0, chain: Promise.resolve() };
-    const read = async (path: string) => { const file = await this.copy(record, path, signal); if (!record.pairs.has(file.target.targetKey)) this.retain(record, file); return file; };
-    const file = await read(request.path);
-    if (JSON.stringify(file.version) !== request.version) throw new Error('原文件已更新，请重新选择。');
-    record.before = await this.snapshot(record, file, read);
-    for (const pair of record.pairs.values()) if ((await this.copy(record, pair.before.path, signal)).version !== pair.before.version) throw new Error('关联文件已更新，请重新选择。');
-    signal.throwIfAborted();
-    for (const old of unsent) if (old.summary.state === 'prepared') this.records.delete(old.summary.id);
-    for (const old of evicted) if (this.records.get(old.summary.id) === old && !old.busy) this.discard(old);
-    this.records.set(record.summary.id, record);
-    return this.summary(record);
+      signal = this.signal(signal);
+      const root = await this.host.fs.resolve(session.header.cwd, { signal });
+      const record: RecordEntry = { summary: { id: crypto.randomUUID(), path: request.path, instruction: request.instruction, created: this.now(), state: 'prepared', files: [], problems: [] },
+        session, root, pairs: new Map(), before: { source: '', assets: [] }, checked: false, busy: false, bytes: 0, chain: Promise.resolve() };
+      const read = async (path: string) => { const file = await this.copy(record, path, signal); if (!record.pairs.has(file.target.targetKey)) this.retain(record, file); return file; };
+      const file = await read(request.path);
+      if (JSON.stringify(file.version) !== request.version) throw new StaleError('原文件已更新，请重新选择。');
+      record.before = await this.snapshot(record, file, read);
+      for (const pair of record.pairs.values()) if ((await this.copy(record, pair.before.path, signal)).version !== pair.before.version) throw new StaleError('关联文件已更新，请重新选择。');
+      signal.throwIfAborted();
+      for (const old of unsent) if (old.summary.state === 'prepared') this.records.delete(old.summary.id);
+      for (const old of evicted) if (this.records.get(old.summary.id) === old && !old.busy) this.discard(old);
+      this.records.set(record.summary.id, record);
+      return { change: this.summary(record) };
+    } catch (error) {
+      if (error instanceof StaleError || requested.aborted || this.lifetime.signal.aborted) throw error;
+      // Limits, unreadable files and timeouts affect only the record; the request is still valid.
+      return { skipped: `${String((error as Error)?.message ?? error).replace(/[。.]$/, '')}。` };
     } finally { this.preparing.delete(session.id); }
   }
   /**
-   * Records to drop so a new one fits within 8 records and 64 MiB: rolled-back records, then records finished more than
-   * 7 days ago, oldest first. Anything newer or unfinished stays; if that is not enough the user removes records by hand.
+   * Records to drop so a new one fits: at most 10 per session, 40 in all and about 64 MiB. Only finished records are
+   * dropped, rolled back first, then failed, then the oldest; unfinished or busy ones stay. Undefined when that is not enough.
    */
-  private evictions(excluded: RecordEntry[]): RecordEntry[] {
-    const kept = [...this.records.values()].filter(r => !excluded.includes(r)), cutoff = this.now() - KEEP_MS;
-    const full = () => kept.length + this.preparing.size >= MAX_RECORDS
-      || kept.reduce((n, r) => n + r.bytes + (r.after ? 0 : MAX_BYTES), (1 + this.preparing.size) * 2 * MAX_BYTES) > BUDGET;
-    const candidates = kept.filter(r => !r.busy && (r.summary.state === 'restored' || (FINISHED.includes(r.summary.state) && (r.summary.finished ?? r.summary.created) < cutoff)))
-      .sort((a, b) => a.summary.created - b.summary.created);
+  private evictions(session: HistorySession, excluded: RecordEntry[]): RecordEntry[] | undefined {
+    const kept = [...this.records.values()].filter(r => !excluded.includes(r));
+    const own = () => kept.filter(r => r.session.id === session.id).length + 1 > RECORD_LIMITS.session;
+    // An unfinished record is counted twice: its saved result is usually about as large as its baseline.
+    const full = () => kept.length + this.preparing.size + 1 > RECORD_LIMITS.total
+      || kept.reduce((n, r) => n + r.bytes * (r.after ? 1 : 2), 0) > RECORD_LIMITS.bytes;
+    const rank = (r: RecordEntry) => r.summary.state === 'restored' ? 0 : r.summary.state === 'failed' ? 1 : 2;
+    const candidates = kept.filter(r => !r.busy && FINISHED.includes(r.summary.state))
+      .sort((a, b) => rank(a) - rank(b) || (a.summary.finished ?? a.summary.created) - (b.summary.finished ?? b.summary.created));
     const evicted: RecordEntry[] = [];
-    while (full() && candidates.length) { const victim = candidates.shift()!; kept.splice(kept.indexOf(victim), 1); evicted.push(victim); }
-    if (full()) throw new Error('修改记录已满。已回滚或结束超过 7 天的记录会自动清理；其余记录请在“修改记录”中移除不再需要的。');
+    const drop = (victim: RecordEntry) => { kept.splice(kept.indexOf(victim), 1); candidates.splice(candidates.indexOf(victim), 1); evicted.push(victim); };
+    while (own()) { const victim = candidates.find(r => r.session.id === session.id); if (!victim) return; drop(victim); }
+    while (full()) { const victim = candidates[0]; if (!victim) return; drop(victim); }
     return evicted;
   }
   list(session: HistorySession): ChangeSummary[] { return [...this.records.values()].filter(r => r.session.id === session.id).reverse().map(r => this.summary(r)); }
@@ -305,7 +327,14 @@ export class EditHistory {
   }
   private active(session: HistorySession) { return [...this.records.values()].find(r => r.session.id === session.id && r.summary.state === 'running'); }
   async beforeTool(session: HistorySession, signal: AbortSignal) {
-    await Promise.all([...this.records.values()].filter(r => r.summary.state === 'finishing').map(r => r.chain));
+    // A record still saving its result must see the files as its turn left them, so tools that could touch them
+    // (this session, or any session whose workspace overlaps) wait; sessions in unrelated folders do not.
+    const finishing = [...this.records.values()].filter(r => r.summary.state === 'finishing');
+    if (finishing.length) {
+      let root: FsTarget | undefined;
+      try { if (session.header.cwd) root = await this.host.fs.resolve(session.header.cwd, { signal: this.signal(signal) }); } catch { /* Unknown: wait for all. */ }
+      await Promise.all(finishing.filter(r => r.session.id === session.id || !root || this.host.fs.contains(r.root, root) || this.host.fs.contains(root, r.root)).map(r => r.chain));
+    }
     const r = this.active(session); if (!r) return;
     await this.enqueue(r, async () => {
     if (r.checked) return; r.checked = true;

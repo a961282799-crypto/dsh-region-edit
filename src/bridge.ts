@@ -1,4 +1,4 @@
-import { cleanElement, validRegion } from './selection.ts';
+import { cleanElement, collectRegion, overlaps, validRegion } from './selection.ts';
 import type { Region } from './selection.ts';
 import { area, boundsOf, clip } from './lasso.ts';
 import type { Lasso } from './lasso.ts';
@@ -20,7 +20,7 @@ export function connectFrame(frame: HTMLIFrameElement, sources: SourceIndex = {}
     if (validRegion(candidate)) {
       const { box, viewport, text, elements, truncated, polygon, element } = candidate;
       request.resolve({ box, viewport, text, truncated, ...(polygon ? { polygon } : {}),
-        ...(element ? { element: { id: element.id, ...(element.parentId ? { parentId: element.parentId } : {}) } } : {}),
+        ...(element ? { element: { id: element.id, ...(element.parentId ? { parentId: element.parentId } : {}), ...(element.childId ? { childId: element.childId } : {}) } } : {}),
         elements: elements.map(raw => {
           const { sourceKey, ...element } = cleanElement(raw);
           return { ...element, ...(sourceKey && Object.hasOwn(sources, sourceKey) ? { source: sources[sourceKey]! } : {}) };
@@ -66,7 +66,6 @@ export async function readRegion(root: HTMLElement, selection: Selection, signal
   signal.throwIfAborted();
   const image = root.querySelector<HTMLImageElement>('[data-image-preview] img');
   if (image) return collectImage(image, selection);
-  const { collectRegion, overlaps } = await import('./selection.ts');
   for (const frame of root.querySelectorAll('iframe')) {
     const rect = frame.getBoundingClientRect();
     if (!overlaps(box, rect)) continue;

@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { posix } from 'node:path';
-import { EditHistory } from '../src/history.ts';
+import { EditHistory, RECORD_LIMITS } from '../src/history.ts';
 import { changeMarker } from '../src/changes.ts';
 import type { HistoryHost, FsTarget } from '../src/history.ts';
 import type { ChangeText, PreviewSnapshot } from '../src/changes.ts';
 import { FileHistoryStore } from '../src/history-store.ts';
 import type { HistoryStore } from '../src/history-store.ts';
-import { mkdtemp, readdir, rm, writeFile, mkdir } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile, mkdir, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -38,7 +38,9 @@ function fixture(options: { store?: HistoryStore; now?: () => number } = {}) {
     workspaceChanges: { summary: (_session, seq) => summaries.get(seq) }
   };
   let history = new EditHistory(host, options.store, options.now); const signal = new AbortController().signal;
-  const prepare = () => history.prepare(session, { path: '/work/index.html', version: JSON.stringify(files.get('/work/index.html')!.version), instruction: '增大按钮' }, signal);
+  const prepareRaw = (target = session) => history.prepare(target, { path: '/work/index.html', version: JSON.stringify(files.get('/work/index.html')!.version), instruction: '增大按钮' }, signal);
+  // Most tests need a record; a skipped one surfaces as an error carrying its reason.
+  const prepare = async (target = session) => { const result = await prepareRaw(target); if ('skipped' in result) throw new Error(result.skipped); return result.change; };
   const event = (type: string, data: unknown) => { const number = ++seq; history.event(session, { type, data, seq: number }); return number; };
   async function start(id: string, extra = '') { open = ++turn; event('turn/start', { turn }); event('user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: changeMarker(id) + extra }] }); await history.beforeTool(session, signal); }
   async function end(paths?: string[]) {
@@ -47,7 +49,7 @@ function fixture(options: { store?: HistoryStore; now?: () => number } = {}) {
   }
   // reload() simulates a restart: a new history over the same files, reading the given store.
   const reload = async (store: HistoryStore) => { history.dispose(); history = new EditHistory(host, store, options.now); await history.loaded; return history; };
-  return { get history() { return history; }, reload, session, signal, prepare, start, end, event, put, files, writes, html, host, fail: (path: string) => { failPath = path; } };
+  return { get history() { return history; }, reload, session, signal, prepare, prepareRaw, start, end, event, put, files, writes, html, host, fail: (path: string) => { failPath = path; } };
 }
 
 test('frozen HTML and linked CSS survive later edits; guarded rollback preserves exact BOM and CRLF', async () => {
@@ -98,9 +100,18 @@ test('other session and unrecognized markers cannot access or claim a record', a
   assert.equal(f.history.list(f.session)[0]!.state, 'prepared'); f.history.remove(f.session, r.id);
   assert.equal(f.history.list(f.session).length, 0);
 });
-test('workspace escape in an asset is rejected before preparing a request', async () => {
+test('workspace escape in an asset is never read; the request goes out without a record', async () => {
   const f = fixture(); f.put('/work/index.html', '<link rel="stylesheet" href="../private.css">'); f.put('/private.css', 'private');
-  await assert.rejects(f.prepare, /超出/); assert.equal(f.history.list(f.session).length, 0);
+  assert.deepEqual(await f.prepareRaw(), { skipped: '文件超出当前会话工作区。' }); assert.equal(f.history.list(f.session).length, 0);
+});
+test('a stale selection rejects, while record limits and a running turn only skip the record', async () => {
+  const f = fixture();
+  await assert.rejects(f.history.prepare(f.session, { path: '/work/index.html', version: '"stale"', instruction: 'x' }, f.signal), /原文件已更新/);
+  f.put('/work/index.html', 'x'.repeat(1024 * 1024 + 1));
+  assert.deepEqual(await f.prepareRaw(), { skipped: 'HTML 超过 1 MiB。' });
+  f.put('/work/index.html', f.html); f.event('turn/start', { turn: 1 });
+  assert.deepEqual(await f.prepareRaw(), { skipped: '当前会话正在运行。' });
+  assert.equal(f.history.list(f.session).length, 0);
 });
 test('changed binary assets remain frozen but prevent a misleading partial rollback', async () => {
   const f = fixture(); f.put('/work/index.html', '<img src="image.png">'); f.put('/work/image.png', new Uint8Array([0, 1, 2]));
@@ -133,7 +144,7 @@ test('a cancelled prepare retains no unusable record', async () => {
 test('a new request replaces an unsent record, but never a running one', async () => {
   const f = fixture(), first = await f.prepare(), second = await f.prepare();
   assert.deepEqual(f.history.list(f.session).map(r => r.id), [second.id]);
-  await f.start(second.id); await assert.rejects(f.prepare, /这一轮结束|正在进行/);
+  await f.start(second.id); assert.deepEqual(await f.prepareRaw(), { skipped: '当前会话正在运行。' });
   f.put('/work/index.html', 'changed'); await f.end();
   assert.equal(f.history.list(f.session).length, 1); assert.notEqual(first.id, second.id);
 });
@@ -168,11 +179,13 @@ test('detail carries status only; contents come from content() and stay immutabl
 });
 test('frozen snapshots embed what the preview embeds: extensionless imports, noscript content, any rel case', async () => {
   const f = fixture();
-  f.put('/work/index.html', '<!doctype html><link rel="StyleSheet" href="main.css"><noscript><img src="img/fallback.png"></noscript><p>内容</p>');
+  f.put('/work/index.html', '<!doctype html><link rel="StyleSheet" href="main.css"><noscript><img src="img/fallback.png"></noscript><p>内容</p>'
+    + '<picture><source srcset="img/unused.png"><img srcset="img/hi.png 2x, img/lo.png 1x"></picture>');
+  f.put('/work/img/lo.png', new Uint8Array([5]));
   f.put('/work/main.css', '@import url(theme); button{padding:12px}'); f.put('/work/theme', 'body{background:url(img/bg.png)}');
   f.put('/work/img/bg.png', new Uint8Array([1, 2, 3])); f.put('/work/img/fallback.png', new Uint8Array([4]));
   const r = await f.prepare(), before = f.history.content(f.session, r.id, 'before') as PreviewSnapshot;
-  assert.deepEqual(before.assets.map(a => a.reference).sort(), ['img/bg.png', 'img/fallback.png', 'main.css', 'theme']);
+  assert.deepEqual(before.assets.map(a => a.reference).sort(), ['img/bg.png', 'img/fallback.png', 'img/lo.png', 'main.css', 'theme']);
 });
 test('only a running session in an overlapping workspace blocks rollback', async () => {
   const prepareChanged = async () => { const f = fixture(), r = await f.prepare(); await f.start(r.id); f.put('/work/main.css', 'changed'); await f.end(); return { f, r }; };
@@ -187,6 +200,19 @@ test('only a running session in an overlapping workspace blocks rollback', async
   assert.equal((await f.history.restore(f.session, r.id, f.signal)).state, 'restored');
 });
 
+test('tools wait only for records still saving in an overlapping workspace', async () => {
+  const f = fixture(), r = await f.prepare(); await f.start(r.id); f.put('/work/main.css', 'changed');
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  const read = f.host.fs.readBytes; f.host.fs.readBytes = async (...args) => { await gate; return read(...args); };
+  f.event('turn/end', { turn: 1 });
+  assert.equal(f.history.list(f.session)[0]!.state, 'finishing');
+  const order: string[] = [];
+  const elsewhere = f.history.beforeTool({ id: 'x', header: { cwd: '/elsewhere' } }, f.signal).then(() => order.push('elsewhere'));
+  const nested = f.history.beforeTool({ id: 'y', header: { cwd: '/work/sub' } }, f.signal).then(() => order.push('nested'));
+  await elsewhere; await new Promise(resolve => setTimeout(resolve, 10)); assert.deepEqual(order, ['elsewhere']);
+  release(); await nested; f.host.fs.readBytes = read; assert.deepEqual(order, ['elsewhere', 'nested']);
+  await f.history.settled(f.session); assert.equal(f.history.list(f.session)[0]!.state, 'ready');
+});
 const temporaryStore = async () => { const dir = await mkdtemp(join(tmpdir(), 'region-history-')); return { dir, store: () => new FileHistoryStore(dir), cleanup: () => rm(dir, { recursive: true, force: true }) }; };
 test('finished records survive a restart, and rollback then checks exact bytes instead of old version tokens', async () => {
   const t = await temporaryStore();
@@ -235,18 +261,27 @@ test('unfinished records are not stored, released sessions keep finished ones, a
     assert.deepEqual(reloaded.list({ id: 'other', header: { cwd: '/work' } }), []);
   } finally { await t.cleanup(); }
 });
-test('a full history drops rolled-back records, then records older than 7 days, oldest first', async () => {
-  const day = 24 * 60 * 60 * 1000; let clock = 1_000_000_000_000;
-  const f = fixture({ now: () => clock }), ids: string[] = [];
+test('a full session drops its rolled-back, then failed, then oldest finished records, never another session\'s', async () => {
+  let clock = 1_000_000_000_000;
+  const f = fixture({ now: () => clock }), ids: string[] = [], other = { id: 'two', header: { cwd: '/work' } };
   const cycle = async (content: string) => { const r = await f.prepare(); await f.start(r.id); f.put('/work/main.css', content); await f.end(); clock += 1000; return r.id; };
-  for (let i = 0; i < 8; i++) ids.push(await cycle(`v${i}`));
-  await assert.rejects(f.prepare, /已满/);
-  assert.equal((await f.history.restore(f.session, ids[7]!, f.signal)).state, 'restored');
-  const replacement = await cycle('v8');
-  assert.deepEqual(f.history.list(f.session).map(x => x.id), [replacement, ...ids.slice(0, 7).reverse()]);
-  clock += 8 * day;
-  const next = await f.prepare();
-  assert.deepEqual(f.history.list(f.session).map(x => x.id), [next.id, replacement, ...ids.slice(1, 7).reverse()]);
+  f.history.event(other, { type: 'turn/end', seq: 0, data: { turn: 0 } });
+  const foreign = (await f.prepare(other)).id;
+  for (let i = 0; i < RECORD_LIMITS.session; i++) ids.push(await cycle(`v${i}`));
+  const newest = ids.at(-1)!;
+  assert.equal((await f.history.restore(f.session, newest, f.signal)).state, 'restored');
+  // Full: the rolled-back record goes first even though it is the newest.
+  const a = await cycle('a');
+  assert.deepEqual(f.history.list(f.session).map(x => x.id), [a, ...ids.slice(0, -1).reverse()]);
+  // Then the oldest finished one.
+  const b = await cycle('b');
+  assert.deepEqual(f.history.list(f.session).map(x => x.id), [b, a, ...ids.slice(1, -1).reverse()]);
+  assert.deepEqual(f.history.list(other).map(x => x.id), [foreign]);
+});
+test('a full history that cannot drop anything skips the record instead of blocking the request', async () => {
+  const f = fixture(), sessions = Array.from({ length: RECORD_LIMITS.total }, (_, i) => ({ id: `s${i}`, header: { cwd: '/work' } }));
+  for (const s of sessions) await f.prepare(s); // Unsent records are never dropped for another session.
+  assert.deepEqual(await f.prepareRaw(), { skipped: '修改记录已满，且没有可以自动清理的已结束记录。' });
 });
 test('the file store shares identical contents between records and deletes them with the last reference', async () => {
   const t = await temporaryStore();
@@ -260,5 +295,25 @@ test('the file store shares identical contents between records and deletes them 
     await store.remove(b); assert.deepEqual(await readdir(join(t.dir, 'blobs')), []);
     assert.ok((await readdir(join(t.dir, 'records'))).every(name => !name.endsWith('.tmp')));
     await assert.rejects(store.save('../escape', {}), /invalid/);
+  } finally { await t.cleanup(); }
+});
+test('loading cleans up damaged records, settled temporary files and unreferenced blobs, but keeps recent ones', async () => {
+  const t = await temporaryStore();
+  try {
+    const keep = '44444444-4444-4444-8444-444444444444', lost = '55555555-5555-4555-8555-555555555555';
+    const store = t.store(); await store.save(keep, { x: new Uint8Array([1]) }); await store.save(lost, { x: new Uint8Array([2]), y: new Uint8Array([3]) });
+    const blobs = join(t.dir, 'blobs'), records = join(t.dir, 'records');
+    const hashOf = async (id: string) => (JSON.parse(await (await import('node:fs/promises')).readFile(join(records, `${id}.json`), 'utf8')) as { x: { $blob: string } }).x.$blob;
+    await rm(join(blobs, await hashOf(lost)));            // A blob it needs is gone: the record is damaged.
+    await writeFile(join(records, '66666666-6666-4666-8666-666666666666.json'), '{broken');
+    const orphan = 'f'.repeat(64), fresh = 'e'.repeat(64);
+    for (const [dir, name] of [[blobs, orphan], [blobs, fresh], [blobs, 'x.tmp'], [records, 'y.json.tmp'], [blobs, 'notes.txt']] as const) await writeFile(join(dir, name), 'z');
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    for (const dir of [blobs, records]) for (const name of await readdir(dir)) if (name !== fresh) await utimes(join(dir, name), old, old);
+    const loaded = await t.store().load();
+    assert.deepEqual(loaded.map(e => e.id), [keep]);
+    assert.deepEqual((await readdir(records)).sort(), [`${keep}.json`]);
+    // The kept record's blob, a blob too new to judge, and a file the store did not create remain.
+    assert.deepEqual((await readdir(blobs)).sort(), [await hashOf(keep), fresh, 'notes.txt'].sort());
   } finally { await t.cleanup(); }
 });

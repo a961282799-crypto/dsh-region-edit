@@ -13,7 +13,8 @@ export interface Region {
   text: string; elements: SelectedElement[]; truncated: boolean;
   image?: import('./image.ts').ImageSelection;
   polygon?: Point[];
-  element?: { id: string; parentId?: string };
+  /** Opaque handles for the picked element and its outer and inner levels. */
+  element?: { id: string; parentId?: string; childId?: string };
 }
 export const LIMIT = { text: 6000, elements: 12, nodes: 12000, html: 700 } as const;
 /** Graphemes that may have no box of their own: collapsed or hanging spaces and zero-width format characters. */
@@ -174,7 +175,7 @@ export function validRegion(value: unknown): value is Region {
   return !!box(r.box) && !!r.viewport && r.viewport.width > 0 && r.viewport.height > 0
     && ['width','height','scrollX','scrollY'].every(k => Number.isFinite(r.viewport[k as keyof Region['viewport']]) && Math.abs(r.viewport[k as keyof Region['viewport']]) < 1e7)
     && typeof r.text === 'string' && r.text.length <= LIMIT.text && typeof r.truncated === 'boolean' && (r.polygon === undefined || validPoints(r.polygon))
-    && (r.element === undefined || !!r.element && shortString(r.element.id, 64) && (r.element.parentId === undefined || shortString(r.element.parentId, 64)))
+    && (r.element === undefined || !!r.element && shortString(r.element.id, 64) && (r.element.parentId === undefined || shortString(r.element.parentId, 64)) && (r.element.childId === undefined || shortString(r.element.childId, 64)))
     && Array.isArray(r.elements) && r.elements.length <= LIMIT.elements && r.elements.every(e => e && typeof e.tag === 'string' && e.tag.length < 100
       && typeof e.selector === 'string' && e.selector.length < 1500 && typeof e.text === 'string' && e.text.length <= 600
       && typeof e.html === 'string' && e.html.length <= LIMIT.html
@@ -189,7 +190,7 @@ function stringMap(value: unknown, count: number): value is Record<string, strin
 }
 function validContext(c: ElementContext): boolean {
   return !!c && shortString(c.classes, 1000) && shortString(c.inlineStyle, 700) && stringMap(c.styles, 24) && stringMap(c.variables, 12)
-    && Array.isArray(c.rules) && c.rules.length <= 8 && c.rules.every(r => !!r && shortString(r.selector, 300) && shortString(r.declarations, 700) && (r.file === undefined || shortString(r.file, 4096)))
+    && Array.isArray(c.rules) && c.rules.length <= 8 && c.rules.every(r => !!r && shortString(r.selector, 300) && shortString(r.declarations, 700) && (r.file === undefined || shortString(r.file, 4096)) && (r.condition === undefined || shortString(r.condition, 300)))
     && (c.parent === undefined || !!c.parent && shortString(c.parent.tag, 100) && shortString(c.parent.selector, 1500) && shortString(c.parent.classes, 1000) && stringMap(c.parent.styles, 24));
 }
 /** Copy only validated fields; frame-supplied source locations and extra properties are discarded. */
@@ -200,7 +201,7 @@ export function cleanElement(e: SelectedElement): SelectedElement {
   return { tag, selector, text, html, ...(page === undefined ? {} : { page }), ...(cell === undefined ? {} : { cell }),
     ...(sourceKey === undefined ? {} : { sourceKey }), ...(c ? { context: {
       classes: c.classes, inlineStyle: c.inlineStyle, styles: copyMap(c.styles), variables: copyMap(c.variables),
-      rules: c.rules.map(r => ({ selector: r.selector, declarations: r.declarations, ...(r.file === undefined ? {} : { file: r.file }) })),
+      rules: c.rules.map(r => ({ selector: r.selector, declarations: r.declarations, ...(r.file === undefined ? {} : { file: r.file }), ...(r.condition === undefined ? {} : { condition: r.condition }) })),
       ...(c.parent ? { parent: { tag: c.parent.tag, selector: c.parent.selector, classes: c.parent.classes, styles: copyMap(c.parent.styles) } } : {})
     } } : {}) };
 }

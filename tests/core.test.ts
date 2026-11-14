@@ -171,3 +171,50 @@ test('line diff is minimal, reconstructs both sides and reports invisible format
   const blocks = diffBlocks(diffLines(lines.join('\n'), changed.join('\n')).lines);
   assert.deepEqual(blocks.map(b => [b.kind, b.lines.length]), [['gap', 12], ['lines', 8], ['gap', 11]]);
 });
+test('srcset candidates parse like the browser and a static image uses the 1x or first local candidate', async () => {
+  const { parseSrcset, imageReference } = await import('../src/resources.ts');
+  assert.deepEqual(parseSrcset(' a.png 1x,b.png 2x , c,d.png 640w'), [{ url: 'a.png', descriptor: '1x' }, { url: 'b.png', descriptor: '2x' }, { url: 'c,d.png', descriptor: '640w' }]);
+  // A URL runs to the next whitespace, so a comma without a space stays inside it, as the HTML spec says.
+  assert.deepEqual(parseSrcset('a.png,b.png 2x'), [{ url: 'a.png,b.png', descriptor: '2x' }]);
+  assert.deepEqual(parseSrcset('a.png, b.png 2x'), [{ url: 'a.png', descriptor: '' }, { url: 'b.png', descriptor: '2x' }]);
+  assert.deepEqual(parseSrcset(''), []);
+  assert.equal(imageReference('', 'big.png 2x, small.png 1x'), 'small.png');
+  assert.equal(imageReference('', 'w1.webp 320w, w2.webp 640w'), 'w1.webp');
+  assert.equal(imageReference('main.png', 'other.png 1x'), 'main.png');
+  assert.equal(imageReference('', 'https://cdn.example/a.png 1x'), undefined);
+  assert.equal(imageReference('photo.bmp', ''), undefined);
+});
+test('a contour marker is accepted only as base64 JPEG within the size limit, and prompts describe it', async () => {
+  const { decodeMarker, recognitionPrompt, MARKER_MAX_BYTES } = await import('../src/recognition.ts');
+  const { toBase64 } = await import('../src/base64.ts');
+  const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+  assert.deepEqual(decodeMarker(toBase64(jpeg)), jpeg);
+  for (const bad of [undefined, 42, '', '!!!!', toBase64(new Uint8Array([137, 80, 78, 71])), 'A'.repeat(Math.ceil(MARKER_MAX_BYTES / 3) * 4 + 4)]) assert.equal(decodeMarker(bad), undefined);
+  const image = { width: 10, height: 10, pixels: { x: 0, y: 0, width: 5, height: 5 }, normalized: { x: 0, y: 0, width: .5, height: .5 }, polygon: { pixels: [], normalized: [] } };
+  assert.doesNotMatch(recognitionPrompt(image), /第二张图/); assert.match(recognitionPrompt(image, true), /第二张图.*红色描边/);
+  const imageRegion = { ...region, text: '', elements: [], image };
+  assert.doesNotMatch(buildPrompt('C:/a.png', '改', imageRegion), /标记图/);
+  assert.match(buildPrompt('C:/a.png', '改', imageRegion, '', undefined, true), /第二个图片附件是插件用原图生成的缩小标记图.*不要编辑或保存/);
+});
+test('request evidence drops picker geometry, markup the source tag replaces, initial values and non-layout parent styles', () => {
+  const context = { classes: '', inlineStyle: '', variables: {}, rules: [], styles: { display: 'block', margin: '0px', color: 'red', 'line-height': 'normal', border: '0px none rgb(0, 0, 0)' },
+    parent: { tag: 'div', selector: 'div', classes: 'row', styles: { display: 'flex', gap: '8px', color: 'blue', 'font-size': '16px', 'justify-content': 'normal' } } };
+  const source = { line: 3, column: 1, snippet: '<button id="start">' };
+  const picked = { ...region, element: { id: 'e1', parentId: 'e2' }, elements: [{ ...region.elements[0]!, context, source }] };
+  const selection = requestSelection(picked) as Record<string, unknown> & { elements: Record<string, unknown>[] };
+  for (const key of ['box', 'viewport', 'element', 'truncated']) assert.equal(key in selection, false, key);
+  assert.equal('html' in selection.elements[0]!, false);
+  assert.deepEqual(selection.elements[0]!.context, { styles: { display: 'block', color: 'red' }, parent: { tag: 'div', selector: 'div', classes: 'row', styles: { display: 'flex', gap: '8px' } } });
+  // A lasso selection keeps its geometry, and an element without a source location keeps its markup.
+  const lassoed = requestSelection({ ...region, truncated: true }) as Record<string, unknown> & { elements: Record<string, unknown>[] };
+  assert.deepEqual(lassoed.box, region.box); assert.equal(lassoed.truncated, true); assert.equal(lassoed.elements[0]!.html, region.elements[0]!.html);
+});
+test('nested and scoped selectors resolve against their parent as CSS Nesting and @scope define', async () => {
+  const { selectorList, resolveSelector } = await import('../src/css-selector.ts');
+  assert.deepEqual(selectorList('a, b:is(c, d), [title="x,y"] , e'), ['a', 'b:is(c, d)', '[title="x,y"]', 'e']);
+  assert.equal(resolveSelector('&:hover', '.card'), ':is(.card):hover');
+  assert.equal(resolveSelector('.icon, > span', '.a, .b'), ':is(.a, .b) .icon, :is(.a, .b) > span');
+  assert.equal(resolveSelector('.x &', '.card'), '.x :is(.card)');
+  assert.equal(resolveSelector(':scope > p', '.box', true), ':is(.box) > p');
+  assert.equal(resolveSelector(':scope > p', '.box'), ':is(.box) :scope > p');
+});

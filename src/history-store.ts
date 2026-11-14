@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -18,7 +18,12 @@ export function defaultHistoryDirectory(env: Record<string, string | undefined> 
 }
 
 const RECORD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, BLOB = /^[0-9a-f]{64}$/;
+/** Leftovers younger than this may belong to a write still in progress (another Harness window), so they stay. */
+const SETTLED_MS = 10 * 60 * 1000;
 type Tree = unknown;
+/** Permanently unusable: unparsable, or a blob it needs is gone or altered. A busy or locked file is not damaged. */
+class Damaged extends Error {}
+const missing = (error: unknown) => (error as { code?: string })?.code === 'ENOENT';
 
 /**
  * records/<id>.json holds the record; file contents live once in blobs/<sha256>, shared between the before and after
@@ -35,30 +40,57 @@ export class FileHistoryStore implements HistoryStore {
     await writeFile(temporary, data, { flag: 'wx' });
     try { await rename(temporary, path); } catch (error) { await rm(temporary, { force: true }); throw error; }
   }
+  /**
+   * Load every usable record, and clean up what earlier runs left behind: damaged records, temporary files and blobs
+   * no record refers to. When a record could not be read for a passing reason, its blobs are kept.
+   */
   load() {
     return this.serial(async () => {
       let names: string[];
       try { names = await readdir(this.records); } catch { return []; }
-      const loaded: { id: string; value: unknown }[] = [];
+      const loaded: { id: string; value: unknown }[] = [], live = new Set<string>();
+      let known = true;
       for (const name of names) {
+        if (name.endsWith('.tmp')) { await this.removeSettled(join(this.records, name)); continue; }
         const id = name.replace(/\.json$/, '');
         if (!name.endsWith('.json') || !RECORD_ID.test(id)) continue;
-        // A damaged record or a missing blob drops only that record.
+        const hashes = new Set<string>();
         try {
-          const hashes = new Set<string>();
-          const encoded: Tree = JSON.parse(await readFile(join(this.records, name), 'utf8'));
+          const text = await readFile(join(this.records, name), 'utf8');
+          let encoded: Tree;
+          try { encoded = JSON.parse(text); collect(encoded, hashes); } catch { throw new Damaged(); }
           const contents = new Map<string, Uint8Array>();
-          collect(encoded, hashes);
           for (const hash of hashes) {
-            const data = new Uint8Array(await readFile(join(this.blobs, hash)));
-            if (createHash('sha256').update(data).digest('hex') !== hash) throw new Error('blob mismatch');
+            let data: Uint8Array;
+            try { data = new Uint8Array(await readFile(join(this.blobs, hash))); } catch (error) { throw missing(error) ? new Damaged() : error; }
+            if (createHash('sha256').update(data).digest('hex') !== hash) throw new Damaged();
             contents.set(hash, data);
           }
           loaded.push({ id, value: decode(encoded, contents) }); this.references.set(id, hashes);
-        } catch { /* Skipped: it never reaches the panel and is never restored. */ }
+          for (const hash of hashes) live.add(hash);
+        } catch (error) {
+          // Never shown and never restored. Damaged records are deleted; others may load next time.
+          if (error instanceof Damaged) await rm(join(this.records, name), { force: true }).catch(() => undefined);
+          else if (!missing(error)) { known = false; for (const hash of hashes) live.add(hash); }
+        }
       }
+      await this.sweep(known ? live : undefined);
       return loaded;
     });
+  }
+  /** Delete temporary blobs and, when every record's references are known, blobs nothing refers to. */
+  private async sweep(live: Set<string> | undefined) {
+    let names: string[];
+    try { names = await readdir(this.blobs); } catch { return; }
+    for (const name of names) {
+      if (name.endsWith('.tmp') || live && BLOB.test(name) && !live.has(name)) await this.removeSettled(join(this.blobs, name));
+    }
+  }
+  private async removeSettled(path: string) {
+    try {
+      const info = await lstat(path);
+      if (info.isFile() && Date.now() - info.mtimeMs > SETTLED_MS) await rm(path, { force: true });
+    } catch { /* Gone already, or not ours to remove. */ }
   }
   save(id: string, value: unknown) {
     if (!RECORD_ID.test(id)) return Promise.reject(new Error('invalid record id'));

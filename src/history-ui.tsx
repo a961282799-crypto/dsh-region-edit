@@ -175,17 +175,33 @@ function HistoryDialog({ api, cache, records, loadError, refresh, onClose }: { a
     {error && <p className="re-inline-error" role="alert">{error}</p>}
   </div></div>, document.body);
 }
+/**
+ * How often the record list is refreshed: an open panel and a running turn change within seconds; with the panel
+ * closed, a request waiting to be sent changes only when the user sends it. Zero: nothing to watch.
+ */
+export function pollDelay(records: readonly ChangeSummary[], open: boolean): number {
+  if (open || records.some(r => r.state === 'running' || r.state === 'finishing')) return 2000;
+  return records.some(r => r.state === 'prepared') ? 10000 : 0;
+}
 export function HistoryAction({ api, revision }: { api: ChangeApi; revision: number }) {
   const [records, setRecords] = useState<ChangeSummary[]>([]), [open, setOpen] = useState(false), [tick, setTick] = useState(0), [error, setError] = useState('');
   const cache = useRef(new ContentCache()).current;
   useEffect(() => cache.retain(records.map(r => r.id)), [cache, records]);
-  const active = records.some(r => ['prepared', 'running', 'finishing'].includes(r.state));
   useEffect(() => {
     const abort = new AbortController();
     void api.list(abort.signal).then(value => { if (!abort.signal.aborted) { setRecords(value); setError(''); } }).catch(e => { if (!abort.signal.aborted) setError(String(e.message ?? e)); });
     return () => abort.abort();
   }, [api, revision, tick, open]);
-  useEffect(() => { if (!active && !open) return; const timer = window.setInterval(() => setTick(n => n + 1), 2000); return () => clearInterval(timer); }, [active, open]);
+  const delay = pollDelay(records, open);
+  // Poll only while something can change, and not while the window is hidden; showing it again refreshes at once.
+  useEffect(() => {
+    if (!delay) return;
+    let timer: number | undefined;
+    if (!document.hidden) timer = window.setTimeout(() => setTick(n => n + 1), delay);
+    const visibility = () => { window.clearTimeout(timer); if (!document.hidden) setTick(n => n + 1); };
+    document.addEventListener('visibilitychange', visibility);
+    return () => { window.clearTimeout(timer); document.removeEventListener('visibilitychange', visibility); };
+  }, [delay, tick]);
   return <><button type="button" className="re-tool" onClick={() => setOpen(true)} title={error || '查看修改前后效果并安全回滚'}>修改记录{records.length ? ` · ${records.length}` : ''}</button>
     {open && <HistoryDialog api={api} cache={cache} records={records} loadError={error} refresh={() => setTick(n => n + 1)} onClose={() => setOpen(false)} />}</>;
 }
