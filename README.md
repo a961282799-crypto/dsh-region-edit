@@ -113,3 +113,15 @@ npm run pack:plugin  # 先运行全部检查，再生成 artifacts/dsh-region-ed
 - `src/host.ts` 集中声明插件使用的宿主接口。升级 Harness 后先核对这些接口，再更新兼容声明。
 
 版本改动见 [CHANGELOG.md](CHANGELOG.md)，每个版本的验证过程见 [VALIDATION.md](VALIDATION.md)。插件只提交修改请求，具体修改由当前会话的模型与工具完成。
+
+## 支持作者
+
+项目免费开源、没有广告，也不打算加。如果这个插件让你少截了几次图、少描述了几遍位置，欢迎请我喝杯咖啡——完全自愿，不影响任何功能，也不影响后续更新。
+
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/a961282799-crypto/dsh-region-edit/main/assets/donate-wechat.jpg" width="220" alt="微信赞赏码">
+
+<sub>手机上：长按图片保存 → 微信「扫一扫」→ 从相册选取</sub>
+
+</div>
